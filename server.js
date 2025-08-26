@@ -8,6 +8,56 @@ const QRCode = require('qrcode');
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
+// ---- allow embedding of QR page from Lovable + your app ----
+const FRAME_WHITELIST = [
+  /\.lovable\.app$/,                // any *.lovable.app
+  'https://coachflow.growthgrid.me',
+  'https://lovable.app',
+  'coachflow.growthgrid.me',
+  'https://app.lovable.app' // your own app host (adjust if needed)
+];
+
+function isAllowedFrameOrigin(origin) {
+  if (!origin) return true; // let non-browser tools pass
+  try {
+    const { hostname } = new URL(origin);
+    return FRAME_WHITELIST.some(p =>
+      p instanceof RegExp ? p.test(hostname) : hostname === p
+    );
+  } catch {
+    return false;
+  }
+}
+
+app.use((req, res, next) => {
+  // CORS (what Lovable asked for)
+  const origin = req.headers.origin;
+  if (isAllowedFrameOrigin(origin)) {
+    if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS,POST,DELETE');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,x-api-key');
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+
+  // If the requested URL is the QR endpoint, set frame headers
+  // so browsers allow <iframe> embedding from Lovable.
+  if (/^\/sessions\/[^/]+\/qr(?:$|\/)/.test(req.path)) {
+    // Allow frames only from your trusted apps
+    res.setHeader(
+      'Content-Security-Policy',
+      "frame-ancestors 'self' https://*.lovable.app https://coachflow.growthgrid.me"
+    );
+    // X-Frame-Options is legacy but some browsers still look at it.
+    // ALLOWALL is accepted by Firefox/Chromium to disable the block.
+    res.setHeader('X-Frame-Options', 'ALLOWALL');
+    // Some browsers also enforce CORP; make it explicit.
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  }
+
+  next();
+});
+
 const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || ''; // set this in Coolify
 const BASE_AUTH_DIR = path.resolve(process.env.BASE_AUTH_DIR || './data/auth'); // mount /app/data, uses /app/data/auth/<trainerId>

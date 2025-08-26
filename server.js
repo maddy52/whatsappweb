@@ -2,7 +2,6 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const QRCode = require('qrcode');
 
@@ -10,10 +9,10 @@ const app = express();
 app.use(express.json({ limit: '1mb' }));
 
 const PORT = process.env.PORT || 3000;
-const API_TOKEN = process.env.API_TOKEN || ''; // set in Coolify env
-const BASE_AUTH_DIR = path.resolve(process.env.BASE_AUTH_DIR || './data/auth'); // mount /app/data
+const API_TOKEN = process.env.API_TOKEN || ''; // set this in Coolify
+const BASE_AUTH_DIR = path.resolve(process.env.BASE_AUTH_DIR || './data/auth'); // mount /app/data, uses /app/data/auth/<trainerId>
 
-// ------- tiny auth middleware -------
+// ---------- auth middleware ----------
 function requireApiKey(req, res, next) {
   if (!API_TOKEN) return res.status(500).json({ error: 'API token not set' });
   const token = req.get('x-api-key');
@@ -21,8 +20,10 @@ function requireApiKey(req, res, next) {
   next();
 }
 
-// ------- helpers -------
-function ensureDir(p) { try { fs.mkdirSync(p, { recursive: true }); } catch {} }
+// ---------- helpers ----------
+function ensureDir(p) {
+  try { fs.mkdirSync(p, { recursive: true }); } catch {}
+}
 
 function cleanChromiumLocks(baseDir) {
   try {
@@ -40,16 +41,12 @@ function cleanChromiumLocks(baseDir) {
   } catch {}
 }
 
-function killChromium() {
-  try { execSync('pkill -9 -f chromium || true'); } catch {}
-}
-
-// ------- session manager -------
-const sessions = new Map(); // trainerId -> { client, ready, lastQR, lastError }
-
 function getAuthPath(trainerId) {
   return path.join(BASE_AUTH_DIR, trainerId);
 }
+
+// ---------- session manager ----------
+const sessions = new Map(); // trainerId -> { client, ready, lastQR, lastError }
 
 function createClient(trainerId) {
   const authPath = getAuthPath(trainerId);
@@ -62,10 +59,17 @@ function createClient(trainerId) {
     puppeteer: {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
+      // DO NOT set userDataDir when using LocalAuth
       args: [
-        '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-        '--disable-gpu', '--no-zygote', '--no-first-run', '--no-default-browser-check',
-        '--password-store=basic', '--use-mock-keychain'
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-zygote',
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--password-store=basic',
+        '--use-mock-keychain'
       ]
     }
   });
@@ -75,10 +79,9 @@ function createClient(trainerId) {
   client.on('disconnected', (reason) => {
     state.ready = false;
     state.lastError = `disconnected: ${reason}`;
-    // Try to re-init after a pause
     setTimeout(() => initSession(trainerId), 5000);
   });
-  client.on('auth_failure', (m) => { state.ready = false; state.lastError = `auth_failure: ${m}`; });
+  client.on('auth_failure', (msg) => { state.ready = false; state.lastError = `auth_failure: ${msg}`; });
 
   state.client = client;
   sessions.set(trainerId, state);
@@ -98,7 +101,6 @@ function initSession(trainerId) {
   return s.client.initialize().catch((err) => {
     s.ready = false;
     s.lastError = err?.message || String(err);
-    // hard clean & retry
     setTimeout(() => {
       cleanChromiumLocks(getAuthPath(trainerId));
       initSession(trainerId);
@@ -106,11 +108,14 @@ function initSession(trainerId) {
   });
 }
 
-// ------- routes -------
+// ---------- routes ----------
 // health
 app.get('/healthz', (_req, res) => res.status(200).send('ok'));
 
-// list sessions (in-memory)
+// root
+app.get('/', (_req, res) => res.send('WhatsApp sender gateway is up.'));
+
+// list active (in-memory) sessions
 app.get('/sessions', requireApiKey, (_req, res) => {
   const list = Array.from(sessions.entries()).map(([id, s]) => ({
     trainerId: id, ready: !!s.ready, qrAvailable: !!s.lastQR, lastError: s.lastError
@@ -118,7 +123,7 @@ app.get('/sessions', requireApiKey, (_req, res) => {
   res.json({ sessions: list });
 });
 
-// create/init session
+// create/init a session for a trainer
 app.post('/sessions', requireApiKey, async (req, res) => {
   const { trainerId } = req.body || {};
   if (!trainerId) return res.status(400).json({ error: 'trainerId is required' });
@@ -127,7 +132,7 @@ app.post('/sessions', requireApiKey, async (req, res) => {
   res.json({ ok: true, trainerId });
 });
 
-// get session status
+// session status
 app.get('/sessions/:id/status', requireApiKey, (req, res) => {
   const id = req.params.id;
   const s = sessions.get(id);
@@ -135,43 +140,48 @@ app.get('/sessions/:id/status', requireApiKey, (req, res) => {
   res.json({ ready: !!s.ready, qrAvailable: !!s.lastQR, lastError: s.lastError });
 });
 
-// QR page (HTML)
+// QR page (HTML). Add requireApiKey here if you want to protect it.
 app.get('/sessions/:id/qr', (req, res) => {
-  // QR is used by humans; auth not strictly needed. Add requireApiKey if you want.
   const id = req.params.id;
   const s = sessions.get(id);
   if (!s) return res.status(404).send('Session not found. Have you created it?');
   if (!s.lastQR) return res.status(404).send('QR not available yet. Refresh after logs show "qr".');
-  QRCode.toDataURL(s.lastQR).then((dataUrl) => {
-    res.set('Content-Type', 'text/html').send(`
-      <html><head><meta name="viewport" content="width=device-width, initial-scale=1"/></head>
-      <body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial">
-        <h2>Scan this with WhatsApp (${id})</h2>
-        <img src="${dataUrl}" alt="QR" style="max-width:360px;width:100%;height:auto;border:1px solid #ddd;border-radius:12px;padding:8px"/>
-        <p>WhatsApp → Settings → Linked devices → Link a device.</p>
-      </body></html>
-    `);
-  }).catch(() => res.status(500).send('Failed to render QR.'));
+  QRCode.toDataURL(s.lastQR)
+    .then((dataUrl) => {
+      res.set('Content-Type', 'text/html').send(`
+        <html><head><meta name="viewport" content="width=device-width, initial-scale=1"/></head>
+        <body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial">
+          <h2>Scan this with WhatsApp (${id})</h2>
+          <img src="${dataUrl}" alt="QR" style="max-width:360px;width:100%;height:auto;border:1px solid #ddd;border-radius:12px;padding:8px"/>
+          <p>WhatsApp → Settings → Linked devices → Link a device.</p>
+        </body></html>
+      `);
+    })
+    .catch(() => res.status(500).send('Failed to render QR.'));
 });
 
-// send message
+// send text message (with JID resolution, safe)
 app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
   const id = req.params.id;
   const { to, text } = req.body || {};
   if (!to || !text) return res.status(400).json({ error: 'to and text required' });
+
   const s = sessions.get(id);
   if (!s || !s.client) return res.status(404).json({ error: 'session not found' });
   if (!s.ready) return res.status(503).json({ error: 'session not ready' });
+
   try {
-    const jid = to.includes('@c.us') ? to : `${String(to).replace(/\D/g, '')}@c.us`;
-    const sent = await s.client.sendMessage(jid, text);
-    res.json({ ok: true, id: sent?.id?.id || null });
+    const digits = String(to).replace(/\D/g, '');
+    const numberId = await s.client.getNumberId(digits);
+    if (!numberId) return res.status(404).json({ error: 'number is not on WhatsApp' });
+    const sent = await s.client.sendMessage(numberId._serialized, text);
+    res.json({ ok: true, id: sent?.id?.id || null, to: numberId._serialized });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
 
-// logout (keeps folder, will require QR next init)
+// logout (keeps files, will require new QR next init)
 app.post('/sessions/:id/logout', requireApiKey, async (req, res) => {
   const id = req.params.id;
   const s = sessions.get(id);
@@ -180,7 +190,7 @@ app.post('/sessions/:id/logout', requireApiKey, async (req, res) => {
   catch (e) { res.status(500).json({ ok: false, error: e?.message || String(e) }); }
 });
 
-// delete session (optionally purge files)
+// delete session (optionally purge persistent files)
 app.delete('/sessions/:id', requireApiKey, async (req, res) => {
   const id = req.params.id;
   const purge = String(req.query.purge || 'false') === 'true';
@@ -189,9 +199,6 @@ app.delete('/sessions/:id', requireApiKey, async (req, res) => {
   res.json({ ok: true, purged: purge });
 });
 
-// optional root
-app.get('/', (_req, res) => res.send('WhatsApp sender gateway is up.'));
-
-// start
+// ---------- start ----------
 ensureDir(BASE_AUTH_DIR);
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));

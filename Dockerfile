@@ -4,7 +4,7 @@ FROM node:20-bookworm-slim
 RUN apt-get update && apt-get install -y \
     chromium \
     curl \
-    procps \        # <— adds pkill/pgrep
+    procps \
     ca-certificates \
     fonts-liberation \
     libasound2 \
@@ -27,9 +27,9 @@ RUN apt-get update && apt-get install -y \
     wget \
   && rm -rf /var/lib/apt/lists/*
 
-ENV NODE_ENV=production
-ENV XDG_CONFIG_HOME=/tmp/xdg
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+ENV XDG_CONFIG_HOME=/tmp/xdg
 
 WORKDIR /app
 COPY package*.json ./

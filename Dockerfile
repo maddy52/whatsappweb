@@ -3,6 +3,7 @@ FROM node:20-bookworm-slim
 # Install Chromium and required libs for Puppeteer
 RUN apt-get update && apt-get install -y \
     chromium \
+    curl \
     ca-certificates \
     fonts-liberation \
     libasound2 \

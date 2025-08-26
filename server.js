@@ -1,5 +1,6 @@
 const express = require('express');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const QRCode = require('qrcode');
@@ -11,10 +12,35 @@ let lastQR = null;
 let ready = false;
 let lastError = null;
 
-// --- Health ---
+/* ---------- Chromium profile handling ---------- */
+// Use a unique default profile location per boot without userDataDir (OK with LocalAuth)
+const uniqueXDG = `/tmp/xdg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+process.env.XDG_CONFIG_HOME = uniqueXDG;                       // <- key trick
+const chromiumConfigDir = path.join(uniqueXDG, 'chromium');
+try { fs.mkdirSync(chromiumConfigDir, { recursive: true }); } catch {}
+
+function cleanChromiumLocks() {
+  const homeConfig = path.join(os.homedir(), '.config', 'chromium');
+  const candidates = [
+    path.join(chromiumConfigDir, 'SingletonLock'),
+    path.join(chromiumConfigDir, 'SingletonCookie'),
+    path.join(chromiumConfigDir, 'SingletonSocket'),
+    // just in case Chromium ignores XDG in your image:
+    path.join(homeConfig, 'SingletonLock'),
+    path.join(homeConfig, 'SingletonCookie'),
+    path.join(homeConfig, 'SingletonSocket'),
+    path.join(chromiumConfigDir, 'Default', 'SingletonLock'),
+    path.join(chromiumConfigDir, 'Default', 'SingletonCookie'),
+    path.join(chromiumConfigDir, 'Default', 'SingletonSocket')
+  ];
+  for (const p of candidates) { try { fs.rmSync(p, { force: true }); } catch {} }
+}
+/* ------------------------------------------------ */
+
+// Healthcheck
 app.get('/healthz', (_req, res) => res.status(200).send('ok'));
 
-// --- QR page ---
+// QR page
 app.get('/qr', async (_req, res) => {
   if (!lastQR) return res.status(404).send('QR not available yet. Refresh after you see "QR received" in Logs.');
   try {
@@ -34,16 +60,16 @@ app.get('/qr', async (_req, res) => {
   }
 });
 
-// --- Status/debug ---
+// Status/debug
 app.get('/status', (_req, res) => res.json({ ready, qrAvailable: !!lastQR, lastError }));
 
-// --- Re-init without clearing auth ---
+// Re-init without clearing auth
 app.get('/reinit', async (_req, res) => {
   try { await safeDestroy(); initClient(); res.json({ ok: true, msg: 'Client reinitialising' }); }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-// --- Logout to force a new QR (clears current session) ---
+// Logout to force a new QR (clears current session)
 app.get('/logout', async (_req, res) => {
   try {
     if (global._wwebClient) await global._wwebClient.logout();
@@ -52,8 +78,7 @@ app.get('/logout', async (_req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-// --- Simple send endpoint ---
-// /send?to=9715XXXXXXXX&text=Hello
+// Simple send test  /send?to=9715XXXXXXXX&text=Hello
 app.get('/send', async (req, res) => {
   try {
     if (!ready) return res.status(503).json({ ok: false, error: 'Client not ready' });
@@ -66,12 +91,13 @@ app.get('/send', async (req, res) => {
 });
 
 function createClient() {
+  cleanChromiumLocks();
   const client = new Client({
-    authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth' }), // persisted on your volume
+    authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth' }), // persisted in your volume
     puppeteer: {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
-      // IMPORTANT: do NOT set userDataDir and do NOT pass --user-data-dir when using LocalAuth
+      // DO NOT set userDataDir and DO NOT pass --user-data-dir with LocalAuth
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -105,7 +131,8 @@ function initClient() {
   global._wwebClient.initialize().catch((err) => {
     lastError = err && err.message ? err.message : String(err);
     console.error('Client initialize failed:', lastError);
-    setTimeout(initClient, 5000);
+    // Clean locks and retry after a short delay
+    setTimeout(() => { cleanChromiumLocks(); initClient(); }, 5000);
   });
 }
 

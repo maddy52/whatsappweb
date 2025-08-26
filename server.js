@@ -18,7 +18,7 @@ const allowedOrigins = [
   /^https:\/\/.*\.lovable\.app$/,
   'https://lovable.app',
   'https://app.lovable.app',
-  'https://whatappi.growthgrid.me'
+  'https://whatappi.growthgrid.me',
   'https://coachflow.growthgrid.me'
 ];
 

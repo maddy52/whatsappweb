@@ -4,7 +4,6 @@ const fs = require('fs');
 const path = require('path');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const QRCode = require('qrcode');
-const cors = require('cors');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -13,7 +12,7 @@ const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || ''; // set this in Coolify
 const BASE_AUTH_DIR = path.resolve(process.env.BASE_AUTH_DIR || './data/auth'); // mount /app/data, uses /app/data/auth/<trainerId>
 
-// ---------- CORS setup ----------
+// ---------- CORS (no external package) ----------
 const allowedOrigins = [
   /^https:\/\/.*\.lovable\.app$/,
   'https://lovable.app',
@@ -22,20 +21,25 @@ const allowedOrigins = [
   'https://coachflow.growthgrid.me'
 ];
 
-const corsOptions = {
-  origin: function (origin, cb) {
-    if (!origin) return cb(null, true);
-    const ok = allowedOrigins.some((entry) =>
-      entry instanceof RegExp ? entry.test(origin) : entry === origin
-    );
-    cb(ok ? null : new Error('Not allowed by CORS'), ok);
-  },
-  methods: ['GET', 'HEAD', 'OPTIONS', 'POST', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key']
-};
+function isOriginAllowed(origin) {
+  if (!origin) return true; // curl/postman/no-origin
+  return allowedOrigins.some((entry) =>
+    entry instanceof RegExp ? entry.test(origin) : entry === origin
+  );
+}
 
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (isOriginAllowed(origin)) {
+    if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS,POST,DELETE');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,x-api-key');
+    // Not using credentials; if you ever do, also set Access-Control-Allow-Credentials: true
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
 // ---------- auth middleware ----------
 function requireApiKey(req, res, next) {

@@ -1,104 +1,86 @@
 const express = require('express');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
+const { execSync } = require('child_process');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const QRCode = require('qrcode');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- Globals for status/QR ---
 let lastQR = null;
 let ready = false;
 let lastError = null;
 
-// The persisted LocalAuth directory (mounted via Coolify volume)
-const AUTH_DIR = path.resolve(process.env.WWEBJS_AUTH_DIR || './.wwebjs_auth');
+const AUTH_DIR = path.resolve('./.wwebjs_auth');
 
-// Remove Chromium “Singleton*” lock files anywhere under a base dir
-function removeChromiumSingletons(baseDir) {
+function killChromium() {
+  try { execSync('pkill -9 -f chromium || true'); } catch {}
+}
+
+function cleanChromiumLocks(baseDir) {
   try {
     if (!fs.existsSync(baseDir)) return;
     const stack = [baseDir];
     const targets = new Set(['SingletonLock', 'SingletonCookie', 'SingletonSocket']);
     while (stack.length) {
       const d = stack.pop();
-      for (const name of fs.readdirSync(d, { withFileTypes: true })) {
-        const p = path.join(d, name.name);
-        if (name.isDirectory()) {
-          stack.push(p);
-        } else if (targets.has(name.name)) {
-          try { fs.rmSync(p, { force: true }); } catch {}
-        }
+      for (const ent of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, ent.name);
+        if (ent.isDirectory()) stack.push(p);
+        else if (targets.has(ent.name)) { try { fs.rmSync(p, { force: true }); } catch {} }
       }
     }
   } catch {}
 }
 
-// Healthcheck
 app.get('/healthz', (_req, res) => res.status(200).send('ok'));
 
-// QR page
 app.get('/qr', async (_req, res) => {
   if (!lastQR) return res.status(404).send('QR not available yet. Refresh after you see "QR received" in Logs.');
   try {
     const dataUrl = await QRCode.toDataURL(lastQR);
     res.set('Content-Type', 'text/html').send(`
-      <html>
-        <head><meta name="viewport" content="width=device-width, initial-scale=1"/></head>
-        <body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial">
-          <h2>Scan this with WhatsApp on your phone</h2>
-          <img src="${dataUrl}" alt="QR" style="max-width:360px;width:100%;height:auto;border:1px solid #ddd;border-radius:12px;padding:8px"/>
-          <p>WhatsApp → Settings → Linked devices → Link a device.</p>
-        </body>
-      </html>
+      <html><head><meta name="viewport" content="width=device-width, initial-scale=1"/></head>
+      <body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial">
+        <h2>Scan this with WhatsApp on your phone</h2>
+        <img src="${dataUrl}" alt="QR" style="max-width:360px;width:100%;height:auto;border:1px solid #ddd;border-radius:12px;padding:8px"/>
+        <p>WhatsApp → Settings → Linked devices → Link a device.</p>
+      </body></html>
     `);
-  } catch {
-    res.status(500).send('Failed to render QR.');
-  }
+  } catch { res.status(500).send('Failed to render QR.'); }
 });
 
-// Status/debug
 app.get('/status', (_req, res) => res.json({ ready, qrAvailable: !!lastQR, lastError }));
 
-// Re-init without clearing auth
-app.get('/reinit', async (_req, res) => {
-  try { await safeDestroy(); initClient(true); res.json({ ok: true, msg: 'Client reinitialising' }); }
-  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
-});
-
-// Logout to force a new QR (clears current session)
+app.get('/reinit', async (_req, res) => { try { await safeDestroy(); initClient(true); res.json({ ok:true }); } catch(e){ res.status(500).json({ ok:false, error:e.message }); }});
 app.get('/logout', async (_req, res) => {
-  try {
-    if (global._wwebClient) { await global._wwebClient.logout(); }
-    await safeDestroy(); initClient(true);
-    res.json({ ok: true, msg: 'Logged out; new QR will be generated.' });
-  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  try { if (global._wwebClient) await global._wwebClient.logout(); await safeDestroy(); initClient(true); res.json({ ok:true }); }
+  catch(e){ res.status(500).json({ ok:false, error:e.message }); }
 });
 
-// Simple send test  /send?to=9715XXXXXXXX&text=Hello
+// Simple send tester: /send?to=9715XXXXXXXX&text=Hello
 app.get('/send', async (req, res) => {
   try {
-    if (!ready) return res.status(503).json({ ok: false, error: 'Client not ready' });
+    if (!ready) return res.status(503).json({ ok:false, error:'Client not ready' });
     const to = (req.query.to || '').replace(/\D/g, '');
     const text = req.query.text || '';
-    if (!to || !text) return res.status(400).json({ error: 'to and text are required' });
+    if (!to || !text) return res.status(400).json({ error:'to and text are required' });
     const sent = await global._wwebClient.sendMessage(`${to}@c.us`, text);
-    res.json({ ok: true, id: sent.id.id });
-  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+    res.json({ ok:true, id: sent.id.id });
+  } catch (e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
 function createClient() {
-  // Clean any leftover Chromium locks INSIDE the LocalAuth profile tree
-  removeChromiumSingletons(AUTH_DIR);
+  killChromium();
+  cleanChromiumLocks(AUTH_DIR);
 
   const client = new Client({
-    authStrategy: new LocalAuth({ dataPath: AUTH_DIR }), // persisted on your volume
+    authStrategy: new LocalAuth({ dataPath: AUTH_DIR, clientId: 'prod-1' }),
     puppeteer: {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
-      // Do NOT set userDataDir with LocalAuth; it manages its own under AUTH_DIR
+      // DO NOT set userDataDir with LocalAuth
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -117,25 +99,25 @@ function createClient() {
   client.on('ready', () => { ready = true; console.log('WhatsApp client is ready'); });
   client.on('disconnected', (reason) => { ready = false; console.log('WhatsApp client disconnected:', reason); setTimeout(() => initClient(true), 5000); });
   client.on('message', (msg) => console.log('RECV:', msg.from, msg.body));
-
   return client;
 }
 
 async function safeDestroy() {
   try { if (global._wwebClient) await global._wwebClient.destroy(); } catch {}
+  killChromium();
+  cleanChromiumLocks(AUTH_DIR);
   global._wwebClient = null; ready = false; lastQR = null;
 }
 
-// If firstBoot=true, do an extra aggressive clean of locks
-function initClient(firstBoot = false) {
-  if (firstBoot) removeChromiumSingletons(AUTH_DIR);
+function initClient(first = false) {
+  if (first) { killChromium(); cleanChromiumLocks(AUTH_DIR); }
   global._wwebClient = createClient();
   lastError = null;
   global._wwebClient.initialize().catch((err) => {
     lastError = err && err.message ? err.message : String(err);
     console.error('Client initialize failed:', lastError);
-    // Clean locks and retry after a short delay
-    setTimeout(() => { removeChromiumSingletons(AUTH_DIR); initClient(); }, 5000);
+    // Hard clean and retry
+    setTimeout(() => { killChromium(); cleanChromiumLocks(AUTH_DIR); initClient(); }, 5000);
   });
 }
 

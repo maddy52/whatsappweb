@@ -1,5 +1,6 @@
 const express = require('express');
 const fs = require('fs');
+const path = require('path');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const QRCode = require('qrcode');
 
@@ -36,10 +37,23 @@ app.get('/qr', async (req, res) => {
   }
 });
 
-// Isolated Chromium user data dir to avoid profile lock on rolling updates
-const chromiumUserDataDir = '/tmp/chromium';
+// Make a unique Chromium profile dir per container to avoid profile lock on rolling updates
+const uniqueSuffix = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+const chromiumUserDataDir = `/tmp/chromium-${uniqueSuffix}`;
 try { fs.mkdirSync(chromiumUserDataDir, { recursive: true }); } catch {}
-try { fs.rmSync(`${chromiumUserDataDir}/SingletonLock`, { force: true }); } catch {}
+
+// Clean common Chromium lock files if they exist
+const possibleLocks = [
+  path.join(chromiumUserDataDir, 'SingletonLock'),
+  path.join(chromiumUserDataDir, 'SingletonCookie'),
+  '/root/.config/chromium/SingletonLock',
+  '/root/.config/chromium/SingletonCookie',
+  '/home/node/.config/chromium/SingletonLock',
+  '/home/node/.config/chromium/SingletonCookie'
+];
+for (const p of possibleLocks) {
+  try { fs.rmSync(p, { force: true }); } catch {}
+}
 
 // Create and initialise the WhatsApp client
 const client = new Client({
@@ -51,19 +65,22 @@ const client = new Client({
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      `--user-data-dir=${chromiumUserDataDir}`,
+      '--disable-gpu',
+      '--no-zygote',
       '--no-first-run',
-      '--no-default-browser-check'
+      '--no-default-browser-check',
+      `--user-data-dir=${chromiumUserDataDir}`,
+      '--profile-directory=Default'
     ]
   }
 });
 
-// Optional: log incoming messages to runtime logs
+// Log incoming messages to runtime logs
 client.on('message', (msg) => {
   console.log('RECV:', msg.from, msg.body);
 });
 
-// Optional: quick test endpoint to send a message
+// Quick test endpoint to send a message
 // Use: /send?to=9715XXXXXXXX&text=Hello
 app.get('/send', async (req, res) => {
   try {

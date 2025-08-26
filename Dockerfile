@@ -27,6 +27,7 @@ RUN apt-get update && apt-get install -y \
   && rm -rf /var/lib/apt/lists/*
 
 ENV NODE_ENV=production
+ENV XDG_CONFIG_HOME=/tmp/xdg
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 WORKDIR /app

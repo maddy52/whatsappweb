@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const QRCode = require('qrcode');
+const cors = require('cors');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -11,6 +12,30 @@ app.use(express.json({ limit: '1mb' }));
 const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || ''; // set this in Coolify
 const BASE_AUTH_DIR = path.resolve(process.env.BASE_AUTH_DIR || './data/auth'); // mount /app/data, uses /app/data/auth/<trainerId>
+
+// ---------- CORS setup ----------
+const allowedOrigins = [
+  /^https:\/\/.*\.lovable\.app$/,
+  'https://lovable.app',
+  'https://app.lovable.app',
+  'https://whatappi.growthgrid.me'
+  'https://coachflow.growthgrid.me'
+];
+
+const corsOptions = {
+  origin: function (origin, cb) {
+    if (!origin) return cb(null, true);
+    const ok = allowedOrigins.some((entry) =>
+      entry instanceof RegExp ? entry.test(origin) : entry === origin
+    );
+    cb(ok ? null : new Error('Not allowed by CORS'), ok);
+  },
+  methods: ['GET', 'HEAD', 'OPTIONS', 'POST', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key']
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
 // ---------- auth middleware ----------
 function requireApiKey(req, res, next) {
@@ -59,7 +84,6 @@ function createClient(trainerId) {
     puppeteer: {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
-      // DO NOT set userDataDir when using LocalAuth
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -109,13 +133,10 @@ function initSession(trainerId) {
 }
 
 // ---------- routes ----------
-// health
 app.get('/healthz', (_req, res) => res.status(200).send('ok'));
 
-// root
 app.get('/', (_req, res) => res.send('WhatsApp sender gateway is up.'));
 
-// list active (in-memory) sessions
 app.get('/sessions', requireApiKey, (_req, res) => {
   const list = Array.from(sessions.entries()).map(([id, s]) => ({
     trainerId: id, ready: !!s.ready, qrAvailable: !!s.lastQR, lastError: s.lastError
@@ -123,7 +144,6 @@ app.get('/sessions', requireApiKey, (_req, res) => {
   res.json({ sessions: list });
 });
 
-// create/init a session for a trainer
 app.post('/sessions', requireApiKey, async (req, res) => {
   const { trainerId } = req.body || {};
   if (!trainerId) return res.status(400).json({ error: 'trainerId is required' });
@@ -132,7 +152,6 @@ app.post('/sessions', requireApiKey, async (req, res) => {
   res.json({ ok: true, trainerId });
 });
 
-// session status
 app.get('/sessions/:id/status', requireApiKey, (req, res) => {
   const id = req.params.id;
   const s = sessions.get(id);
@@ -140,15 +159,27 @@ app.get('/sessions/:id/status', requireApiKey, (req, res) => {
   res.json({ ready: !!s.ready, qrAvailable: !!s.lastQR, lastError: s.lastError });
 });
 
-// QR page (HTML). Add requireApiKey here if you want to protect it.
+// HEAD support for QR endpoint
+app.head('/sessions/:id/qr', (req, res) => {
+  const id = req.params.id;
+  const s = sessions.get(id);
+  if (s?.lastQR) return res.sendStatus(200);
+  return res.sendStatus(404);
+});
+
+// QR page (HTML)
 app.get('/sessions/:id/qr', (req, res) => {
   const id = req.params.id;
   const s = sessions.get(id);
   if (!s) return res.status(404).send('Session not found. Have you created it?');
   if (!s.lastQR) return res.status(404).send('QR not available yet. Refresh after logs show "qr".');
+
   QRCode.toDataURL(s.lastQR)
     .then((dataUrl) => {
-      res.set('Content-Type', 'text/html').send(`
+      res.setHeader('Content-Type', 'text/html');
+      res.setHeader('Content-Security-Policy', "frame-ancestors 'self' https://*.lovable.app");
+      res.setHeader('X-Frame-Options', 'ALLOWALL');
+      res.send(`
         <html><head><meta name="viewport" content="width=device-width, initial-scale=1"/></head>
         <body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial">
           <h2>Scan this with WhatsApp (${id})</h2>
@@ -160,7 +191,6 @@ app.get('/sessions/:id/qr', (req, res) => {
     .catch(() => res.status(500).send('Failed to render QR.'));
 });
 
-// send text message (with JID resolution, safe)
 app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
   const id = req.params.id;
   const { to, text } = req.body || {};
@@ -181,7 +211,6 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
   }
 });
 
-// logout (keeps files, will require new QR next init)
 app.post('/sessions/:id/logout', requireApiKey, async (req, res) => {
   const id = req.params.id;
   const s = sessions.get(id);
@@ -190,7 +219,6 @@ app.post('/sessions/:id/logout', requireApiKey, async (req, res) => {
   catch (e) { res.status(500).json({ ok: false, error: e?.message || String(e) }); }
 });
 
-// delete session (optionally purge persistent files)
 app.delete('/sessions/:id', requireApiKey, async (req, res) => {
   const id = req.params.id;
   const purge = String(req.query.purge || 'false') === 'true';

@@ -99,6 +99,9 @@ function createClient() {
   client.on('ready', () => { ready = true; console.log('WhatsApp client is ready'); });
   client.on('disconnected', (reason) => { ready = false; console.log('WhatsApp client disconnected:', reason); setTimeout(() => initClient(true), 5000); });
  //client.on('message', (msg) => console.log('RECV:', msg.from, msg.body));
+  client.on('message', (msg) => {
+  if (msg.type === 'error') console.error("WhatsApp Error:", msg.body);
+});
   return client;
 }
 

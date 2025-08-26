@@ -8,34 +8,33 @@ const QRCode = require('qrcode');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// --- Globals for status/QR ---
 let lastQR = null;
 let ready = false;
 let lastError = null;
 
-/* ---------- Chromium profile handling ---------- */
-// Use a unique default profile location per boot without userDataDir (OK with LocalAuth)
-const uniqueXDG = `/tmp/xdg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-process.env.XDG_CONFIG_HOME = uniqueXDG;                       // <- key trick
-const chromiumConfigDir = path.join(uniqueXDG, 'chromium');
-try { fs.mkdirSync(chromiumConfigDir, { recursive: true }); } catch {}
+// The persisted LocalAuth directory (mounted via Coolify volume)
+const AUTH_DIR = path.resolve(process.env.WWEBJS_AUTH_DIR || './.wwebjs_auth');
 
-function cleanChromiumLocks() {
-  const homeConfig = path.join(os.homedir(), '.config', 'chromium');
-  const candidates = [
-    path.join(chromiumConfigDir, 'SingletonLock'),
-    path.join(chromiumConfigDir, 'SingletonCookie'),
-    path.join(chromiumConfigDir, 'SingletonSocket'),
-    // just in case Chromium ignores XDG in your image:
-    path.join(homeConfig, 'SingletonLock'),
-    path.join(homeConfig, 'SingletonCookie'),
-    path.join(homeConfig, 'SingletonSocket'),
-    path.join(chromiumConfigDir, 'Default', 'SingletonLock'),
-    path.join(chromiumConfigDir, 'Default', 'SingletonCookie'),
-    path.join(chromiumConfigDir, 'Default', 'SingletonSocket')
-  ];
-  for (const p of candidates) { try { fs.rmSync(p, { force: true }); } catch {} }
+// Remove Chromium “Singleton*” lock files anywhere under a base dir
+function removeChromiumSingletons(baseDir) {
+  try {
+    if (!fs.existsSync(baseDir)) return;
+    const stack = [baseDir];
+    const targets = new Set(['SingletonLock', 'SingletonCookie', 'SingletonSocket']);
+    while (stack.length) {
+      const d = stack.pop();
+      for (const name of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, name.name);
+        if (name.isDirectory()) {
+          stack.push(p);
+        } else if (targets.has(name.name)) {
+          try { fs.rmSync(p, { force: true }); } catch {}
+        }
+      }
+    }
+  } catch {}
 }
-/* ------------------------------------------------ */
 
 // Healthcheck
 app.get('/healthz', (_req, res) => res.status(200).send('ok'));
@@ -65,15 +64,15 @@ app.get('/status', (_req, res) => res.json({ ready, qrAvailable: !!lastQR, lastE
 
 // Re-init without clearing auth
 app.get('/reinit', async (_req, res) => {
-  try { await safeDestroy(); initClient(); res.json({ ok: true, msg: 'Client reinitialising' }); }
+  try { await safeDestroy(); initClient(true); res.json({ ok: true, msg: 'Client reinitialising' }); }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 // Logout to force a new QR (clears current session)
 app.get('/logout', async (_req, res) => {
   try {
-    if (global._wwebClient) await global._wwebClient.logout();
-    await safeDestroy(); initClient();
+    if (global._wwebClient) { await global._wwebClient.logout(); }
+    await safeDestroy(); initClient(true);
     res.json({ ok: true, msg: 'Logged out; new QR will be generated.' });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
@@ -91,13 +90,15 @@ app.get('/send', async (req, res) => {
 });
 
 function createClient() {
-  cleanChromiumLocks();
+  // Clean any leftover Chromium locks INSIDE the LocalAuth profile tree
+  removeChromiumSingletons(AUTH_DIR);
+
   const client = new Client({
-    authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth' }), // persisted in your volume
+    authStrategy: new LocalAuth({ dataPath: AUTH_DIR }), // persisted on your volume
     puppeteer: {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
-      // DO NOT set userDataDir and DO NOT pass --user-data-dir with LocalAuth
+      // Do NOT set userDataDir with LocalAuth; it manages its own under AUTH_DIR
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -114,7 +115,7 @@ function createClient() {
 
   client.on('qr', (qr) => { lastQR = qr; console.log('QR received, visit /qr to scan.'); });
   client.on('ready', () => { ready = true; console.log('WhatsApp client is ready'); });
-  client.on('disconnected', (reason) => { ready = false; console.log('WhatsApp client disconnected:', reason); setTimeout(initClient, 5000); });
+  client.on('disconnected', (reason) => { ready = false; console.log('WhatsApp client disconnected:', reason); setTimeout(() => initClient(true), 5000); });
   client.on('message', (msg) => console.log('RECV:', msg.from, msg.body));
 
   return client;
@@ -125,17 +126,19 @@ async function safeDestroy() {
   global._wwebClient = null; ready = false; lastQR = null;
 }
 
-function initClient() {
+// If firstBoot=true, do an extra aggressive clean of locks
+function initClient(firstBoot = false) {
+  if (firstBoot) removeChromiumSingletons(AUTH_DIR);
   global._wwebClient = createClient();
   lastError = null;
   global._wwebClient.initialize().catch((err) => {
     lastError = err && err.message ? err.message : String(err);
     console.error('Client initialize failed:', lastError);
     // Clean locks and retry after a short delay
-    setTimeout(() => { cleanChromiumLocks(); initClient(); }, 5000);
+    setTimeout(() => { removeChromiumSingletons(AUTH_DIR); initClient(); }, 5000);
   });
 }
 
-initClient();
+initClient(true);
 
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));

@@ -79,7 +79,12 @@ app.use((req, res, next) => {
   // For QR endpoints → add frame embedding headers
   if (/^\/sessions\/[^/]+\/qr(?:$|\/)/.test(req.path)) {
     const frameAllowed = FRAME_WHITELIST
-    .map(p => (p instanceof RegExp ? null : p))
+    .map(p => {
+      if (p instanceof RegExp) return null;
+      // Ensure proper scheme
+      if (p.startsWith("http")) return p;
+      return "https://" + p;
+    })
     .filter(Boolean)
     .join(" ");
   res.setHeader(

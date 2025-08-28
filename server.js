@@ -229,6 +229,20 @@ app.head('/sessions/:id/qr', (req, res) => {
   return res.sendStatus(404);
 });
 
+// QR as JSON (return data URL)
+app.get('/sessions/:id/qr.json', (req, res) => {
+  const id = req.params.id;
+  const s = sessions.get(id);
+  if (!s) return res.status(404).json({ error: 'Session not found. Have you created it?' });
+  if (!s.lastQR) return res.status(404).json({ error: 'QR not available yet. Refresh after logs show "qr".' });
+
+  QRCode.toDataURL(s.lastQR)
+    .then((dataUrl) => {
+      res.json({ qr: dataUrl });
+    })
+    .catch(() => res.status(500).json({ error: 'Failed to render QR.' }));
+});
+
 // QR page (HTML)
 app.get('/sessions/:id/qr', (req, res) => {
   const id = req.params.id;

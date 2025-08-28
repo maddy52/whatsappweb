@@ -8,21 +8,44 @@ const QRCode = require('qrcode');
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// ---- allow embedding of QR page from Lovable + your app ----
+const PORT = process.env.PORT || 3000;
+const API_TOKEN = process.env.API_TOKEN || ''; // set this in Coolify
+const BASE_AUTH_DIR = path.resolve(process.env.BASE_AUTH_DIR || './data/auth'); // mount /app/data, uses /app/data/auth/<trainerId>
+
+// ---------- CORS + Frame Security ----------
+
+// Domains allowed for API calls
+const ALLOWED_ORIGINS = [
+  /^https:\/\/.*\.lovable\.app$/,
+  'https://lovable.app',
+  'https://app.lovable.app',
+  'https://whatappi.growthgrid.me',
+  'https://coachflow.growthgrid.me',
+  'http://localhost:8080', // dev frontend
+];
+
+// Domains allowed to embed QR in iframe
 const FRAME_WHITELIST = [
-  /\.lovable\.app$/,                // any *.lovable.app
+  /\.lovable\.app$/,
   'https://coachflow.growthgrid.me',
   'https://lovable.app',
   'coachflow.growthgrid.me',
-  'https://app.lovable.app',  
-  'http://localhost:8080'// your own app host (adjust if needed)
+  'https://app.lovable.app',
+  'http://localhost:8080',
 ];
 
-function isAllowedFrameOrigin(origin) {
-  if (!origin) return true; // let non-browser tools pass
+function isOriginAllowed(origin) {
+  if (!origin) return true; // curl, Postman
+  return ALLOWED_ORIGINS.some((entry) =>
+    entry instanceof RegExp ? entry.test(origin) : entry === origin
+  );
+}
+
+function isFrameAllowed(origin) {
+  if (!origin) return false;
   try {
     const { hostname } = new URL(origin);
-    return FRAME_WHITELIST.some(p =>
+    return FRAME_WHITELIST.some((p) =>
       p instanceof RegExp ? p.test(hostname) : hostname === p
     );
   } catch {
@@ -30,70 +53,42 @@ function isAllowedFrameOrigin(origin) {
   }
 }
 
+// Unified middleware
 app.use((req, res, next) => {
-  // CORS (what Lovable asked for)
   const origin = req.headers.origin;
-  console.log("origin:", origin, "allowed?", isOriginAllowed(origin));
-  if (isAllowedFrameOrigin(origin)) {
-    if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS,POST,DELETE');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,x-api-key');
-  }
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  const allowed = isOriginAllowed(origin);
 
-  // If the requested URL is the QR endpoint, set frame headers
-  // so browsers allow <iframe> embedding from Lovable.
-  if (/^\/sessions\/[^/]+\/qr(?:$|\/)/.test(req.path)) {
-    // Allow frames only from your trusted apps
+  if (allowed) {
+    if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
     res.setHeader(
-      'Content-Security-Policy',
-      "frame-ancestors 'self' https://*.lovable.app https://coachflow.growthgrid.me"
+      "Access-Control-Allow-Methods",
+      "GET,HEAD,OPTIONS,POST,DELETE"
     );
-    // X-Frame-Options is legacy but some browsers still look at it.
-    // ALLOWALL is accepted by Firefox/Chromium to disable the block.
-    res.setHeader('X-Frame-Options', 'ALLOWALL');
-    // Some browsers also enforce CORP; make it explicit.
-    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type,Authorization,x-api-key"
+    );
+  }
+
+  // Handle preflight OPTIONS early, but include headers
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+
+  // For QR endpoints → add frame embedding headers
+  if (/^\/sessions\/[^/]+\/qr(?:$|\/)/.test(req.path)) {
+    res.setHeader(
+      "Content-Security-Policy",
+      "frame-ancestors 'self' https://*.lovable.app https://coachflow.growthgrid.me http://localhost:8080"
+    );
+    res.setHeader("X-Frame-Options", "ALLOWALL");
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
   }
 
   next();
 });
 
-const PORT = process.env.PORT || 3000;
-const API_TOKEN = process.env.API_TOKEN || ''; // set this in Coolify
-const BASE_AUTH_DIR = path.resolve(process.env.BASE_AUTH_DIR || './data/auth'); // mount /app/data, uses /app/data/auth/<trainerId>
-
-// ---------- CORS (no external package) ----------
-const allowedOrigins = [
-  /^https:\/\/.*\.lovable\.app$/,
-  'https://lovable.app',
-  'https://app.lovable.app',
-  'https://whatappi.growthgrid.me',
-  'https://coachflow.growthgrid.me',
-  'http://localhost:8080'
-];
-
-function isOriginAllowed(origin) {
-  if (!origin) return true; // curl/postman/no-origin
-  return allowedOrigins.some((entry) =>
-    entry instanceof RegExp ? entry.test(origin) : entry === origin
-  );
-}
-
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  console.log("origin:", origin, "allowed?", isOriginAllowed(origin));
-  if (isOriginAllowed(origin)) {
-    if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS,POST,DELETE');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,x-api-key');
-    // Not using credentials; if you ever do, also set Access-Control-Allow-Credentials: true
-  }
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
 
 // ---------- auth middleware ----------
 function requireApiKey(req, res, next) {

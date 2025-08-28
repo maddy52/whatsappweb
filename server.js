@@ -78,10 +78,14 @@ app.use((req, res, next) => {
 
   // For QR endpoints → add frame embedding headers
   if (/^\/sessions\/[^/]+\/qr(?:$|\/)/.test(req.path)) {
-    res.setHeader(
-      "Content-Security-Policy",
-      "frame-ancestors 'self' https://*.lovable.app https://coachflow.growthgrid.me http://localhost:8080"
-    );
+    const frameAllowed = FRAME_WHITELIST
+    .map(p => (p instanceof RegExp ? null : p))
+    .filter(Boolean)
+    .join(" ");
+  res.setHeader(
+    "Content-Security-Policy",
+    `frame-ancestors 'self' ${frameAllowed}`
+  );
     res.setHeader("X-Frame-Options", "ALLOWALL");
     res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
   }

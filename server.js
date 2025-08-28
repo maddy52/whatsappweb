@@ -22,7 +22,6 @@ function isAllowedFrameOrigin(origin) {
   if (!origin) return true; // let non-browser tools pass
   try {
     const { hostname } = new URL(origin);
-    console.log("origin: " + origin);
     return FRAME_WHITELIST.some(p =>
       p instanceof RegExp ? p.test(hostname) : hostname === p
     );
@@ -34,6 +33,9 @@ function isAllowedFrameOrigin(origin) {
 app.use((req, res, next) => {
   // CORS (what Lovable asked for)
   const origin = req.headers.origin;
+  console.log("origin: " + origin);
+  const ref = req.headers.referer;
+  console.log("referer: " + ref);
   if (isAllowedFrameOrigin(origin)) {
     if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
@@ -83,8 +85,10 @@ function isOriginAllowed(origin) {
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
+  console.log("origin: " + origin);
+  const ref = req.headers.referer;
+  console.log("referer: " + ref);
   if (isOriginAllowed(origin)) {
-    console.log("origin: " + origin);
     if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS,POST,DELETE');

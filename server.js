@@ -14,8 +14,7 @@ const FRAME_WHITELIST = [
   'https://coachflow.growthgrid.me',
   'https://lovable.app',
   'coachflow.growthgrid.me',
-  'https://app.lovable.app',
-  'localhost:8080',   
+  'https://app.lovable.app',  
   'http://localhost:8080'// your own app host (adjust if needed)
 ];
 
@@ -23,6 +22,7 @@ function isAllowedFrameOrigin(origin) {
   if (!origin) return true; // let non-browser tools pass
   try {
     const { hostname } = new URL(origin);
+    console.log("origin: " + origin);
     return FRAME_WHITELIST.some(p =>
       p instanceof RegExp ? p.test(hostname) : hostname === p
     );
@@ -84,6 +84,7 @@ function isOriginAllowed(origin) {
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (isOriginAllowed(origin)) {
+    console.log("origin: " + origin);
     if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS,POST,DELETE');

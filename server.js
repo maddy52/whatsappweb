@@ -14,7 +14,9 @@ const FRAME_WHITELIST = [
   'https://coachflow.growthgrid.me',
   'https://lovable.app',
   'coachflow.growthgrid.me',
-  'https://app.lovable.app' // your own app host (adjust if needed)
+  'https://app.lovable.app',
+  'localhost:8080',   
+  'http://localhost:8080'// your own app host (adjust if needed)
 ];
 
 function isAllowedFrameOrigin(origin) {
@@ -68,7 +70,8 @@ const allowedOrigins = [
   'https://lovable.app',
   'https://app.lovable.app',
   'https://whatappi.growthgrid.me',
-  'https://coachflow.growthgrid.me'
+  'https://coachflow.growthgrid.me',
+  'http://localhost:8080'
 ];
 
 function isOriginAllowed(origin) {

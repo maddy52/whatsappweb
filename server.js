@@ -33,9 +33,7 @@ function isAllowedFrameOrigin(origin) {
 app.use((req, res, next) => {
   // CORS (what Lovable asked for)
   const origin = req.headers.origin;
-  console.log("origin: " + origin);
-  const ref = req.headers.referer;
-  console.log("referer: " + ref);
+  console.log("origin:", origin, "allowed?", isOriginAllowed(origin));
   if (isAllowedFrameOrigin(origin)) {
     if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
@@ -85,9 +83,7 @@ function isOriginAllowed(origin) {
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  console.log("origin: " + origin);
-  const ref = req.headers.referer;
-  console.log("referer: " + ref);
+  console.log("origin:", origin, "allowed?", isOriginAllowed(origin));
   if (isOriginAllowed(origin)) {
     if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');

@@ -472,12 +472,12 @@ app.post('/sessions/:id/send', async (req, res) => {
   }
 
   try {
-    let client = sessions.get(sessionId);
+    let state = sessions.get(sessionId);
 
     // If no client, spin one up
-    if (!client) {
-      client = createClientInstance(sessionId);
-      sessions.set(sessionId, client);
+    if (!state) {
+      state = createClientInstance(sessionId);
+      sessions.set(sessionId, state);
 
       // Wait for WhatsApp Web to be ready
       await new Promise((resolve, reject) => {

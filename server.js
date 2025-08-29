@@ -464,40 +464,44 @@ app.get('/sessions/:id/qr', (req, res) => {
  * Behavior: initialize client if necessary, send, then IMMEDIATELY destroy Chromium (keeping auth).
  * This minimizes CPU and RAM usage between sends.
  */
-app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
-  const id = req.params.id;
-  const { to, text } = req.body || {};
-  if (!to || !text) return res.status(400).json({ error: 'to and text required' });
+app.post('/sessions/:id/send', async (req, res) => {
+  const { sessionId, to, message } = req.body;
 
-  // serialize per-trainer initialization/send to avoid multiple Chromium spawning
-  const state = getOrCreateState(id);
+  if (!sessionId || !to || !message) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
 
   try {
-    // initialize (spin Chromium) if not ready
-    if (!state.ready || !state.client) {
-      await ensureInitialized(id);
+    let client = sessions.get(sessionId);
+
+    // If no client, spin one up
+    if (!client) {
+      client = createClient(sessionId);
+      sessions.set(sessionId, client);
+
+      // Wait for WhatsApp Web to be ready
+      await new Promise((resolve, reject) => {
+        client.once('ready', resolve);
+        client.once('auth_failure', reject);
+        client.initialize().catch(reject);
+      });
     }
-    setIdleReaper(id);
 
-    // basic phone number normalization
-    const digits = String(to).replace(/\D/g, '');
-    const numberId = await state.client.getNumberId(digits);
-    if (!numberId) {
-      // immediately free resources on failure to avoid lingering Chromium
-      try { await stopClientKeepAuth(id); } catch {}
-      return res.status(404).json({ error: 'number is not on WhatsApp' });
+    // By this point client is guaranteed ready
+    const chatId = to.includes('@c.us') ? to : `${to}@c.us`;
+    const response = await client.sendMessage(chatId, message);
+
+    res.json({ success: true, response });
+
+    // Optional: teardown if you want short-lived sessions
+    if (IDLE_MS === 0) {
+      client.destroy().catch(() => {});
+      sessions.delete(sessionId);
     }
 
-    const sent = await state.client.sendMessage(numberId._serialized, text);
-
-    // Free Chromium resources immediately (we keep auth)
-    try { await stopClientKeepAuth(id); } catch {}
-
-    res.json({ ok: true, id: sent?.id?.id || null, to: numberId._serialized });
-  } catch (e) {
-    // On error ensure Chromium is not left running
-    try { await stopClientKeepAuth(id); } catch {}
-    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  } catch (err) {
+    console.error('Send failed', err);
+    res.status(500).json({ error: err.message });
   }
 });
 

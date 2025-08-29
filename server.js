@@ -476,7 +476,7 @@ app.post('/sessions/:id/send', async (req, res) => {
 
     // If no client, spin one up
     if (!client) {
-      client = createClient(sessionId);
+      client = createClientInstance(sessionId);
       sessions.set(sessionId, client);
 
       // Wait for WhatsApp Web to be ready

@@ -489,7 +489,7 @@ app.post('/sessions/:id/send', async (req, res) => {
 
     // By this point client is guaranteed ready
     const chatId = to.includes('@c.us') ? to : `${to}@c.us`;
-    const response = await client.sendMessage(chatId, message);
+    const response = await state.client.sendMessage(chatId, message);
 
     res.json({ success: true, response });
 

@@ -464,8 +464,32 @@ app.get('/sessions/:id/qr', (req, res) => {
  * Behavior: initialize client if necessary, send, then IMMEDIATELY destroy Chromium (keeping auth).
  * This minimizes CPU and RAM usage between sends.
  */
+
+async function waitForReady(state) {
+  if (state.ready && state.client) return state.client;
+
+  return new Promise((resolve, reject) => {
+    const onReady = () => {
+      state.ready = true;
+      resolve(state.client);
+    };
+    const onFail = (msg) => reject(new Error(msg || 'Auth failed'));
+
+    state.client.once('ready', onReady);
+    state.client.once('auth_failure', onFail);
+
+    // if not already initialized, kick it off
+    if (!state.client.pupBrowser && !state.client.pupPage) {
+      state.client.initialize().catch(reject);
+    }
+  });
+}
+
 app.post('/sessions/:id/send', async (req, res) => {
-  const { sessionId, to, message } = req.body;
+  const sessionId = req.params.id;
+  let { to, message, text } = req.body;
+
+  if (!message && text) message = text;
 
   if (!sessionId || !to || !message) {
     return res.status(400).json({ error: 'Missing required fields' });
@@ -474,26 +498,20 @@ app.post('/sessions/:id/send', async (req, res) => {
   try {
     let state = sessions.get(sessionId);
 
-    // If no client, spin one up
     if (!state) {
       state = createClientInstance(sessionId);
       sessions.set(sessionId, state);
-
-      // Wait for WhatsApp Web to be ready
-      await new Promise((resolve, reject) => {
-        client.once('ready', resolve);
-        client.once('auth_failure', reject);
-        client.initialize().catch(reject);
-      });
     }
 
-    // By this point client is guaranteed ready
-    const chatId = to.includes('@c.us') ? to : `${to}@c.us`;
-    const response = await state.client.sendMessage(chatId, message);
+    const client = await waitForReady(state);
+
+    const phone = String(to).replace(/\D/g, '');
+    const chatId = phone.includes('@c.us') ? phone : `${phone}@c.us`;
+
+    const response = await client.sendMessage(chatId, message);
 
     res.json({ success: true, response });
 
-    // Optional: teardown if you want short-lived sessions
     if (IDLE_MS === 0) {
       client.destroy().catch(() => {});
       sessions.delete(sessionId);
@@ -504,6 +522,7 @@ app.post('/sessions/:id/send', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 /**
  * Logout: destroys client and wipes auth dir (unless you want to keep auth)

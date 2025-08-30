@@ -1,12 +1,14 @@
 /* Multi-tenant WhatsApp sender gateway (on-demand, lean) */
 const express = require('express');
-const fs = require('fs');
+const fs = require('fs').promises;
+const fssync = require('fs');
 const path = require('path');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const QRCode = require('qrcode');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
+
 
 const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || '';
@@ -35,61 +37,83 @@ const FRAME_WHITELIST = [
 ];
 
 function isOriginAllowed(origin) {
-  if (!origin) return true; // curl/Postman
-  return ALLOWED_ORIGINS.some((entry) =>
-    entry instanceof RegExp ? entry.test(origin) : entry === origin
-  );
+  if (!origin) return true; // Allow curl/Postman
+  return ALLOWED_ORIGINS.some(o => origin === o);
+}
+
+//moiz refractored
+function isValidSessionId(id) {
+  return /^[a-zA-Z0-9_-]+$/.test(id);
+}
+
+//moiz refractored
+function getAuthPath(trainerId) {
+  const fullPath = path.resolve(BASE_AUTH_DIR, trainerId);
+  if (!fullPath.startsWith(BASE_AUTH_DIR)) {
+    throw new Error('Invalid session path');
+  }
+  return fullPath;
 }
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
+
   if (isOriginAllowed(origin)) {
-    if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS,POST,DELETE');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,x-api-key');
+    res.setHeader('Vary', 'Origin');
   }
+
   if (req.method === 'OPTIONS') return res.sendStatus(204);
 
   if (/^\/sessions\/[^/]+\/qr(?:$|\/)/.test(req.path)) {
-    const allowed = FRAME_WHITELIST
-      .map(p => (p instanceof RegExp ? null : (p.startsWith('http') ? p : `https://${p}`)))
-      .filter(Boolean)
-      .join(' ');
+    const allowed = FRAME_WHITELIST.join(' ');
     res.setHeader('Content-Security-Policy', `frame-ancestors 'self' ${allowed}`);
-    res.setHeader('X-Frame-Options', 'ALLOWALL');
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   }
+
   next();
 });
 
 /* ---------------- auth middleware ---------------- */
 
 function requireApiKey(req, res, next) {
-  if (!API_TOKEN) return res.status(500).json({ error: 'API token not set' });
+  if (!API_TOKEN) return res.status(500).json({ error: 'API token not configured' });
+
   const token = req.get('x-api-key');
-  if (token !== API_TOKEN) return res.status(401).json({ error: 'unauthorized' });
+  if (token !== API_TOKEN) return res.status(401).json({ error: 'Unauthorized' });
+
   next();
 }
 
 /* ---------------- helpers ---------------- */
 
-function ensureDir(p) { try { fs.mkdirSync(p, { recursive: true }); } catch {} }
+function ensureDir(p) { try { fssync.mkdirSync(p, { recursive: true }); } catch {} }
 
 function cleanChromiumLocks(baseDir) {
   try {
-    if (!fs.existsSync(baseDir)) return;
+    if (!fssync.existsSync(baseDir)) return;
+
     const stack = [baseDir];
-    const targets = new Set(['SingletonLock', 'SingletonCookie', 'SingletonSocket']);
+    const lockFiles = new Set(['SingletonLock', 'SingletonCookie', 'SingletonSocket']);
+
     while (stack.length) {
-      const d = stack.pop();
-      for (const ent of fs.readdirSync(d, { withFileTypes: true })) {
-        const p = path.join(d, ent.name);
-        if (ent.isDirectory()) stack.push(p);
-        else if (targets.has(ent.name)) { try { fs.rmSync(p, { force: true }); } catch {} }
+      const current = stack.pop();
+      const entries = fssync.readdirSync(current, { withFileTypes: true });
+
+      for (const entry of entries) {
+        const fullPath = path.join(current, entry.name);
+        if (entry.isDirectory()) {
+          stack.push(fullPath);
+        } else if (lockFiles.has(entry.name)) {
+          try { fssync.rmSync(fullPath, { force: true }); } catch {}
+        }
       }
     }
-  } catch {}
+  } catch (err) {
+    console.error('Failed to clean Chromium locks:', err.message);
+  }
 }
 
 function pruneCaches(authPath) {
@@ -103,13 +127,12 @@ function pruneCaches(authPath) {
     'GrShaderCache',
     'ShaderCache',
   ];
-  for (const rel of toDelete) {
-    try { fs.rmSync(path.join(authPath, rel), { recursive: true, force: true }); } catch {}
+  
+  for (const relPath of toDelete) {
+    try {
+      fssync.rmSync(path.join(authPath, relPath), { recursive: true, force: true });
+    } catch {}
   }
-}
-
-function getAuthPath(trainerId) {
-  return path.join(BASE_AUTH_DIR, trainerId);
 }
 
 /* ---------------- session manager ---------------- */
@@ -124,7 +147,13 @@ const sessions = new Map(); // trainerId -> state
 
 function getOrCreateState(trainerId) {
   if (!sessions.has(trainerId)) {
-    sessions.set(trainerId, { client: null, ready: false, lastQR: null, lastError: null, idleTimer: null, initializing: null });
+    sessions.set(trainerId, { 
+      client: null, 
+      ready: false, 
+      lastQR: null, 
+      lastError: null, 
+      idleTimer: null, 
+      initializing: null });
   }
   return sessions.get(trainerId);
 }
@@ -168,57 +197,79 @@ const PUP_FLAGS = [
 ];
 
 function attachNetworkSlimming(client) {
-  // Best-effort: block heavy resources (images, fonts, media, stylesheets, tracking, 3rd-party scripts)
   const page = client?.pupPage;
-  if (!page || typeof page.setRequestInterception !== 'function') return;
+  if (!page || typeof page.setRequestInterception !== 'function') {
+    if (process.env.DEBUG) console.warn('Puppeteer page not ready for interception');
+    return;
+  }
 
-  page.setRequestInterception(true).catch(() => {});
-  page.on('request', req => {
+  page.setRequestInterception(true).catch((err) => {
+    if (process.env.DEBUG) console.error('Failed to enable request interception:', err);
+  });
+
+  page.on('request', (req) => {
     try {
       const type = req.resourceType();
       const url = req.url() || '';
 
-      // Abort obviously heavy resource types
-      if (type === 'image' || type === 'font' || type === 'media' || type === 'stylesheet') {
+      if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
         return req.abort().catch(() => {});
       }
 
-      // Block 3rd-party analytics/tracking and non-whatsapp scripts
       if (/google-analytics\.com|gstatic\.com|doubleclick\.net|googletagmanager|analytics|hotjar|facebook\.net|cdn\.ampproject/.test(url)) {
         return req.abort().catch(() => {});
       }
 
-      // Strip scripts that are not from web.whatsapp.com (very aggressive)
       if (type === 'script' && !/web\.whatsapp\.com/.test(url)) {
         return req.abort().catch(() => {});
       }
 
-      // Otherwise continue
       return req.continue().catch(() => {});
-    } catch {
+    } catch (err) {
+      if (process.env.DEBUG) console.error('Network slimming error:', err);
       try { req.continue().catch(() => {}); } catch {}
     }
   });
 }
 
+
 function setIdleReaper(trainerId) {
   const s = sessions.get(trainerId);
   if (!s) return;
-  if (s.idleTimer) { clearTimeout(s.idleTimer); s.idleTimer = null; }
-  if (!IDLE_MS || IDLE_MS < 10000) return; // disabled if too small/zero
+
+  if (s.idleTimer) {
+    clearTimeout(s.idleTimer);
+    s.idleTimer = null;
+  }
+
+  if (!IDLE_MS || IDLE_MS < 10000) return; // Skip reaping if too low
+
   s.idleTimer = setTimeout(async () => {
+    if (process.env.DEBUG) console.log(`Session ${trainerId} idle for ${IDLE_MS}ms, destroying client...`);
+    
     try {
       if (s.client) await stopClientKeepAuth(trainerId);
-    } catch {}
-    const authPath = getAuthPath(trainerId);
-    pruneCaches(authPath);
+    } catch (err) {
+      if (process.env.DEBUG) console.warn(`Failed to stop client for ${trainerId}:`, err);
+    }
+
+    try {
+      const authPath = getAuthPath(trainerId);
+      pruneCaches(authPath);
+    } catch (err) {
+      if (process.env.DEBUG) console.warn(`Failed to prune caches for ${trainerId}:`, err);
+    }
+
     s.ready = false;
     s.lastQR = null;
     s.lastError = 'idle_destroyed';
     s.client = null;
     s.idleTimer = null;
+
+    if (process.env.DEBUG) console.log(`Session ${trainerId} successfully reaped.`);
   }, IDLE_MS);
 }
+
 
 /**
  * Create the client instance and attach only minimal event handlers.
@@ -239,7 +290,7 @@ function createClientInstance(trainerId) {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
       args: PUP_FLAGS,
-      defaultViewport: { width: 800, height: 600, deviceScaleFactor: 1 },
+      defaultViewport: { width: 800, height: 600 },
       ignoreHTTPSErrors: true
     }
   });
@@ -262,11 +313,13 @@ function createClientInstance(trainerId) {
   });
 
   client.on('authenticated', () => setIdleReaper(trainerId));
+
   client.on('auth_failure', (msg) => {
     state.ready = false;
     state.lastError = `auth_failure: ${msg}`;
     setIdleReaper(trainerId);
   });
+
   client.on('disconnected', (reason) => {
     state.ready = false;
     state.lastError = `disconnected: ${reason}`;
@@ -277,7 +330,7 @@ function createClientInstance(trainerId) {
 
   // Keep a ref but do not mark ready until initialize resolves
   state.client = client;
-  state.lastError = null;
+  // state.lastError = null;
   sessions.set(trainerId, state);
   return state;
 }
@@ -297,13 +350,16 @@ function ensureClientInstance(trainerId) {
 async function stopClientKeepAuth(trainerId) {
   const s = sessions.get(trainerId);
   if (!s) return;
+
   if (s.idleTimer) { clearTimeout(s.idleTimer); s.idleTimer = null; }
   try {
-    if (s.client) {
-      // intentionally use destroy to completely kill Chromium
-      await s.client.destroy();
+    if (state.client) {
+      await state.client.destroy(); // Kills Chromium process
     }
-  } catch {}
+  } catch (err) {
+    console.warn(`stopClientKeepAuth failed for ${sessionId}:`, err.message);
+  }
+
   s.client = null;
   s.ready = false;
   s.lastQR = null;
@@ -340,8 +396,7 @@ async function ensureInitialized(trainerId) {
   // If initialization is already running, wait for it
   if (s.initializing) {
     await s.initializing;
-    if (s.ready) return s;
-    // fallthrough to attempt again
+    return state.ready ? state : Promise.reject(new Error(state.lastError || 'Initialization failed'));
   }
 
   // Create instance if missing
@@ -376,7 +431,10 @@ async function ensureInitialized(trainerId) {
 /* ---------------- routes ---------------- */
 
 app.get('/healthz', (_req, res) => res.status(200).send('ok'));
-app.get('/', (_req, res) => res.send('WhatsApp sender gateway is up.'));
+
+app.get('/', (_req, res) => {
+  res.send('WhatsApp sender gateway is up.');
+});
 
 app.get('/sessions', requireApiKey, (_req, res) => {
   const list = Array.from(sessions.entries()).map(([id, s]) => ({
@@ -391,9 +449,12 @@ app.get('/sessions', requireApiKey, (_req, res) => {
  */
 app.post('/sessions', requireApiKey, async (req, res) => {
   const { trainerId } = req.body || {};
-  if (!trainerId) return res.status(400).json({ error: 'trainerId is required' });
+  if (!trainerId || !isValidSessionId(trainerId)) {
+    return res.status(400).json({ error: 'Invalid or missing trainerId' });
+  }
 
   ensureClientInstance(trainerId);
+
   try {
     // initialize only to show QR / authenticate. If already authenticated, will return quickly.
     await ensureInitialized(trainerId);
@@ -402,7 +463,7 @@ app.post('/sessions', requireApiKey, async (req, res) => {
     // Return progress anyway (we keep state so QR route can check).
   }
   const s = sessions.get(trainerId);
-  res.json({ ok: true, trainerId, ready: !!s.ready, qrAvailable: !!s.lastQR, lastError: s.lastError });
+  res.json({ ok: true, trainerId, ready: !!s?.ready, qrAvailable: !!s?.lastQR, lastError: s?.lastError });
 });
 
 /**
@@ -431,8 +492,8 @@ app.get('/sessions/:id/qr.json', (req, res) => {
   if (!s) return res.status(404).json({ error: 'Session not found. Have you created it?' });
   if (!s.lastQR) return res.status(404).json({ error: 'QR not available yet. Refresh after logs show "qr".' });
   QRCode.toDataURL(s.lastQR)
-    .then((dataUrl) => res.json({ qr: dataUrl }))
-    .catch(() => res.status(500).json({ error: 'Failed to render QR.' }));
+    .then(qr => res.json({ qr }))
+    .catch(() => res.status(500).json({ error: 'Failed to generate QR' }));
 });
 
 // QR page (HTML)
@@ -465,34 +526,52 @@ app.get('/sessions/:id/qr', (req, res) => {
  * This minimizes CPU and RAM usage between sends.
  */
 
-async function waitForReady(state) {
+async function waitForReady(state, timeoutMs = 15000) {
   if (state.ready && state.client) return state.client;
 
   return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('Timeout: Client did not become ready'));
+    }, timeoutMs);
+
     const onReady = () => {
+      cleanup();
       state.ready = true;
       resolve(state.client);
     };
-    const onFail = (msg) => reject(new Error(msg || 'Auth failed'));
+    
+    const onFail = (msg) => {
+      cleanup();
+      reject(new Error(msg || 'Authentication failed'));
+    };
+
+    const cleanup = () => {
+      clearTimeout(timeout);
+      state.client?.off('ready', onReady);
+      state.client?.off('auth_failure', onFail);
+    };
 
     state.client.once('ready', onReady);
     state.client.once('auth_failure', onFail);
 
     // if not already initialized, kick it off
     if (!state.client.pupBrowser && !state.client.pupPage) {
-      state.client.initialize().catch(reject);
+      state.client.initialize().catch((err) => {
+        cleanup();
+        reject(new Error(`Initialize failed: ${err.message}`));
+      });
     }
   });
 }
 
-app.post('/sessions/:id/send', async (req, res) => {
+app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
   const sessionId = req.params.id;
   let { to, message, text } = req.body;
 
-  if (!message && text) message = text;
-
-  if (!sessionId || !to || !message) {
-    return res.status(400).json({ error: 'Missing required fields' });
+  message = message || text;
+  if (!to || !message) {
+    return res.status(400).json({ error: 'Missing "to" or "message"' });
   }
 
   try {
@@ -513,7 +592,7 @@ app.post('/sessions/:id/send', async (req, res) => {
     res.json({ success: true, response });
 
     if (IDLE_MS === 0) {
-      client.destroy().catch(() => {});
+      await client.destroy();
       sessions.delete(sessionId);
     }
 
@@ -527,25 +606,58 @@ app.post('/sessions/:id/send', async (req, res) => {
 /**
  * Logout: destroys client and wipes auth dir (unless you want to keep auth)
  */
+
+//moiz refractored
 app.post('/sessions/:id/logout', requireApiKey, async (req, res) => {
   const id = req.params.id;
+
+  if (!isValidSessionId(id)) {
+    return res.status(400).json({ error: 'Invalid session ID format' });
+  }
+
   const s = sessions.get(id);
-  if (!s) return res.status(404).json({ error: 'session not found' });
+  if (!s) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
   try {
-    if (s.client) await s.client.logout();
+    if (s.client?.logout) {
+      await s.client.logout();
+    }
     await destroySession(id);
     res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  } catch (err) {
+    console.error(`Logout error for ${id}:`, err);
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
 });
 
+//moiz refractored
 app.delete('/sessions/:id', requireApiKey, async (req, res) => {
   const id = req.params.id;
-  const purge = String(req.query.purge || 'false') === 'true';
-  await destroySession(id);
-  if (purge) { try { fs.rmSync(getAuthPath(id), { recursive: true, force: true }); } catch {} }
-  res.json({ ok: true, purged: purge });
+  const purge = String(req.query.purge || 'true') === 'true';
+
+  if (!isValidSessionId(id)) {
+    return res.status(400).json({ error: 'Invalid session ID format' });
+  }
+
+  try {
+    await destroySession(id);
+
+    if (purge) {
+      try {
+        const authPath = getAuthPath(id);
+        await fs.rm(authPath, { recursive: true, force: true });
+      } catch (err) {
+        console.error(`Failed to purge auth data for session ${id}:`, err);
+      }
+    }
+
+    res.json({ ok: true, purged: purge });
+  } catch (e) {
+    console.error(`Failed to delete session ${id}:`, e);
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
 });
 
 /* ---------------- start ---------------- */

@@ -575,14 +575,8 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
   }
 
   try {
-    let state = sessions.get(sessionId);
-
-    if (!state) {
-      state = createClientInstance(sessionId);
-      sessions.set(sessionId, state);
-    }
-
-    const client = await waitForReady(state);
+    const state = await ensureInitialized(sessionId);
+    const client = state.client;
 
     const phone = String(to).replace(/\D/g, '');
     const chatId = phone.includes('@c.us') ? phone : `${phone}@c.us`;
@@ -601,7 +595,6 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 
 /**
  * Logout: destroys client and wipes auth dir (unless you want to keep auth)

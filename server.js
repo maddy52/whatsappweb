@@ -568,8 +568,8 @@ async function waitForReady(state, timeoutMs = 15000) {
 app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
   const sessionId = req.params.id;
   let { to, message, text } = req.body;
-
   message = message || text;
+
   if (!to || !message) {
     return res.status(400).json({ error: 'Missing "to" or "message"' });
   }
@@ -582,16 +582,18 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
     const chatId = phone.includes('@c.us') ? phone : `${phone}@c.us`;
 
     const response = await client.sendMessage(chatId, message);
-
     res.json({ success: true, response });
 
     if (IDLE_MS === 0) {
-      await client.destroy();
-      sessions.delete(sessionId);
+      // Delay destroy to avoid interrupting sendMessage
+      setTimeout(async () => {
+        try { await client.destroy(); } catch {}
+        sessions.delete(sessionId);
+      }, 2000);
     }
 
   } catch (err) {
-    console.error('Send failed', err);
+    console.error('Send failed:', err);
     res.status(500).json({ error: err.message });
   }
 });

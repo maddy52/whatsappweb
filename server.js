@@ -527,6 +527,10 @@ app.get('/sessions/:id/qr', (req, res) => {
  */
 
 async function waitForReady(state, timeoutMs = 15000) {
+  if (!state?.client) {
+    return Promise.reject(new Error('Client is not initialized'));
+  }
+
   if (state.ready && state.client) return state.client;
 
   return new Promise((resolve, reject) => {
@@ -540,7 +544,7 @@ async function waitForReady(state, timeoutMs = 15000) {
       state.ready = true;
       resolve(state.client);
     };
-    
+
     const onFail = (msg) => {
       cleanup();
       reject(new Error(msg || 'Authentication failed'));
@@ -552,8 +556,13 @@ async function waitForReady(state, timeoutMs = 15000) {
       state.client?.off('auth_failure', onFail);
     };
 
-    state.client.once('ready', onReady);
-    state.client.once('auth_failure', onFail);
+    try {
+      state.client.once('ready', onReady);
+      state.client.once('auth_failure', onFail);
+    } catch (err) {
+      cleanup();
+      return reject(new Error(`Failed to attach event handlers: ${err.message}`));
+    }
 
     // if not already initialized, kick it off
     if (!state.client.pupBrowser && !state.client.pupPage) {
@@ -565,8 +574,10 @@ async function waitForReady(state, timeoutMs = 15000) {
   });
 }
 
+
 app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
   const sessionId = req.params.id;
+  console.log(req.body)
   let { to, message, text } = req.body;
 
   message = message || text;
@@ -576,12 +587,13 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
 
   try {
     let state = sessions.get(sessionId);
-
-    if (!state) {
+console.log(state)
+    // 🔒 Ensure both session state and client exist
+    if (!state || !state.client) {
       state = createClientInstance(sessionId);
       sessions.set(sessionId, state);
     }
-
+console.log(state,12)
     const client = await waitForReady(state);
 
     const phone = String(to).replace(/\D/g, '');
@@ -601,6 +613,7 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 
 /**

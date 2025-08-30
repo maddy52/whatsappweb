@@ -525,7 +525,7 @@ app.get('/sessions/:id/qr', (req, res) => {
  * This minimizes CPU and RAM usage between sends.
  */
 
-async function waitForReady(state, timeoutMs = Number(process.env.READY_TIMEOUT_MS || 60000)) {
+async function waitForReady(state, timeoutMs = Number(process.env.READY_TIMEOUT_MS || 10000)) {
   if (!state?.client) {
     throw new Error('Client is not initialized');
   }

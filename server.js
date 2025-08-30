@@ -38,7 +38,9 @@ const FRAME_WHITELIST = [
 
 function isOriginAllowed(origin) {
   if (!origin) return true; // Allow curl/Postman
-  return ALLOWED_ORIGINS.some(o => origin === o);
+  return ALLOWED_ORIGINS.some(o =>
+    o instanceof RegExp ? o.test(origin) : origin === o
+  );
 }
 
 //moiz refractored
@@ -192,7 +194,6 @@ const PUP_FLAGS = [
   '--disk-cache-size=1',
   '--media-cache-size=1',
   '--disable-accelerated-2d-canvas',
-  '--single-process',
   '--headless=new' // modern headless mode
 ];
 
@@ -220,9 +221,9 @@ function attachNetworkSlimming(client) {
         return req.abort().catch(() => {});
       }
 
-      if (type === 'script' && !/web\.whatsapp\.com/.test(url)) {
-        return req.abort().catch(() => {});
-      }
+     if (type === 'script') {
+  return req.continue().catch(() => {});
+}
 
       return req.continue().catch(() => {});
     } catch (err) {
@@ -288,7 +289,7 @@ function createClientInstance(trainerId) {
     takeoverOnConflict: true,
     puppeteer: {
       headless: true,
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       args: PUP_FLAGS,
       defaultViewport: { width: 800, height: 600 },
       ignoreHTTPSErrors: true
@@ -353,11 +354,11 @@ async function stopClientKeepAuth(trainerId) {
 
   if (s.idleTimer) { clearTimeout(s.idleTimer); s.idleTimer = null; }
   try {
-    if (state.client) {
-      await state.client.destroy(); // Kills Chromium process
+    if (s.client) {
+      await s.client.destroy(); // Kills Chromium process
     }
   } catch (err) {
-    console.warn(`stopClientKeepAuth failed for ${sessionId}:`, err.message);
+    console.warn(`stopClientKeepAuth failed for ${trainerId}:`, err.message);
   }
 
   s.client = null;
@@ -395,9 +396,9 @@ async function ensureInitialized(trainerId) {
 
   // If initialization is already running, wait for it
   if (s.initializing) {
-    await s.initializing;
-    return state.ready ? state : Promise.reject(new Error(state.lastError || 'Initialization failed'));
-  }
+  await s.initializing;
+  return s.ready ? s : Promise.reject(new Error(s.lastError || 'Initialization failed'));
+}
 
   // Create instance if missing
   ensureClientInstance(trainerId);
@@ -407,12 +408,11 @@ async function ensureInitialized(trainerId) {
     try {
       // initialize will spawn Chromium (heavy step)
       await s.client.initialize();
-      // quick network slimming once pupPage available, attachNetworkSlimming will check page
       try { attachNetworkSlimming(s.client); } catch {}
       s.lastError = null;
       s.lastQR = s.lastQR || null;
-      s.ready = true;
-      setIdleReaper(trainerId);
+// s.ready will be flipped by client 'ready' event
+setIdleReaper(trainerId);
     } catch (err) {
       s.ready = false;
       s.lastError = err?.message || String(err);
@@ -526,51 +526,89 @@ app.get('/sessions/:id/qr', (req, res) => {
  * This minimizes CPU and RAM usage between sends.
  */
 
-async function waitForReady(state, timeoutMs = 15000) {
+async function waitForReady(state, timeoutMs = Number(process.env.READY_TIMEOUT_MS || 30000)) {
   if (!state?.client) {
-    return Promise.reject(new Error('Client is not initialized'));
+    throw new Error('Client is not initialized');
   }
 
-  if (state.ready && state.client) return state.client;
+  // If a QR is already present, we know we’re not authenticated yet.
+  if (state.lastQR) {
+    throw new Error('Authentication required: scan the QR first');
+  }
 
+  if (state.ready) return state.client;
+
+  // Race: ready/auth_failure/disconnected/timeout, and also poll getState()
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
+    const client = state.client;
+    let settled = false;
+
+    const cleanup = () => {
+      settled = true;
+      clearTimeout(t);
+      client?.off('ready', onReady);
+      client?.off('auth_failure', onFail);
+      client?.off('disconnected', onFail);
+      client?.off('qr', onQR);
+    };
+
+    const onReady = () => {
+      if (settled) return;
+      state.ready = true;
+      cleanup();
+      resolve(client);
+    };
+
+    const onFail = (msg) => {
+      if (settled) return;
+      cleanup();
+      reject(new Error(typeof msg === 'string' ? msg : 'Client failed or disconnected'));
+    };
+
+    const onQR = () => {
+      if (settled) return;
+      cleanup();
+      reject(new Error('Authentication required: scan the QR first'));
+    };
+
+    // Attach listeners BEFORE kicking initialize
+    client.once('ready', onReady);
+    client.once('auth_failure', onFail);
+    client.once('disconnected', onFail);
+    client.once('qr', onQR);
+
+    // Timeout
+    const t = setTimeout(() => {
+      if (settled) return;
       cleanup();
       reject(new Error('Timeout: Client did not become ready'));
     }, timeoutMs);
 
-    const onReady = () => {
-      cleanup();
-      state.ready = true;
-      resolve(state.client);
-    };
-
-    const onFail = (msg) => {
-      cleanup();
-      reject(new Error(msg || 'Authentication failed'));
-    };
-
-    const cleanup = () => {
-      clearTimeout(timeout);
-      state.client?.off('ready', onReady);
-      state.client?.off('auth_failure', onFail);
-    };
-
-    try {
-      state.client.once('ready', onReady);
-      state.client.once('auth_failure', onFail);
-    } catch (err) {
-      cleanup();
-      return reject(new Error(`Failed to attach event handlers: ${err.message}`));
-    }
-
-    // if not already initialized, kick it off
-    if (!state.client.pupBrowser && !state.client.pupPage) {
-      state.client.initialize().catch((err) => {
+    // Kick initialize if needed
+    const needsInit = !client.pupBrowser && !client.pupPage;
+    if (needsInit) {
+      client.initialize().catch(err => {
+        if (settled) return;
         cleanup();
         reject(new Error(`Initialize failed: ${err.message}`));
       });
     }
+
+    // Also poll getState() to fast-path if already connected but 'ready' not yet emitted
+    (async () => {
+      try {
+        // 6 quick probes within timeout
+        const start = Date.now();
+        while (!settled && Date.now() - start < timeoutMs) {
+          const st = await client.getState().catch(() => undefined);
+          if (st === 'CONNECTED') {
+            onReady();
+            return;
+          }
+          await new Promise(r => setTimeout(r, 500));
+        }
+      } catch {} // ignore, rely on main events/timeout
+    })();
   });
 }
 
@@ -578,9 +616,8 @@ async function waitForReady(state, timeoutMs = 15000) {
 app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
   const sessionId = req.params.id;
   console.log(req.body)
-  let { to, message, text } = req.body;
+  let { to, message } = req.body;
 
-  message = message || text;
   if (!to || !message) {
     return res.status(400).json({ error: 'Missing "to" or "message"' });
   }
@@ -593,6 +630,9 @@ console.log(state)
       state = createClientInstance(sessionId);
       sessions.set(sessionId, state);
     }
+    if (state.lastQR) {
+  return res.status(412).json({ error: 'Not authenticated. Please scan QR for this session first.' });
+}
 console.log(state,12)
     const client = await waitForReady(state);
 

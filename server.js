@@ -526,41 +526,37 @@ app.get('/sessions/:id/qr', (req, res) => {
  * This minimizes CPU and RAM usage between sends.
  */
 
-async function waitForReady(state, timeoutMs = 15000) {
-  if (state.ready && state.client) return state.client;
+async function waitForReady(state) {
+  if (state.ready && state.client?.pupPage && state.client?.pupBrowser) {
+    return state.client;
+  }
 
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
-      cleanup();
-      reject(new Error('Timeout: Client did not become ready'));
-    }, timeoutMs);
+      reject(new Error("Client initialization timed out"));
+    }, 15000); // 15 sec timeout
 
     const onReady = () => {
-      cleanup();
+      clearTimeout(timeout);
       state.ready = true;
       resolve(state.client);
     };
-    
+
     const onFail = (msg) => {
-      cleanup();
-      reject(new Error(msg || 'Authentication failed'));
-    };
-
-    const cleanup = () => {
       clearTimeout(timeout);
-      state.client?.off('ready', onReady);
-      state.client?.off('auth_failure', onFail);
+      reject(new Error(msg || 'Auth failed'));
     };
 
-    state.client.once('ready', onReady);
-    state.client.once('auth_failure', onFail);
+    try {
+      state.client.once('ready', onReady);
+      state.client.once('auth_failure', onFail);
 
-    // if not already initialized, kick it off
-    if (!state.client.pupBrowser && !state.client.pupPage) {
-      state.client.initialize().catch((err) => {
-        cleanup();
-        reject(new Error(`Initialize failed: ${err.message}`));
-      });
+      if (!state.client.pupBrowser && !state.client.pupPage) {
+        state.client.initialize().catch(onFail);
+      }
+    } catch (err) {
+      clearTimeout(timeout);
+      reject(err);
     }
   });
 }
@@ -568,8 +564,8 @@ async function waitForReady(state, timeoutMs = 15000) {
 app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
   const sessionId = req.params.id;
   let { to, message, text } = req.body;
-  message = message || text;
 
+  message = message || text;
   if (!to || !message) {
     return res.status(400).json({ error: 'Missing "to" or "message"' });
   }
@@ -578,6 +574,10 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
     const state = await ensureInitialized(sessionId);
     const client = state.client;
 
+    if (!client?.pupBrowser || !client?.pupPage) {
+      return res.status(500).json({ error: "Client not fully initialized or Puppeteer context lost" });
+    }
+
     const phone = String(to).replace(/\D/g, '');
     const chatId = phone.includes('@c.us') ? phone : `${phone}@c.us`;
 
@@ -585,7 +585,6 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
     res.json({ success: true, response });
 
     if (IDLE_MS === 0) {
-      // Delay destroy to avoid interrupting sendMessage
       setTimeout(async () => {
         try { await client.destroy(); } catch {}
         sessions.delete(sessionId);
@@ -594,7 +593,7 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
 
   } catch (err) {
     console.error('Send failed:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err?.message || "Send failed" });
   }
 });
 

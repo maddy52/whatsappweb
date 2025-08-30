@@ -526,37 +526,41 @@ app.get('/sessions/:id/qr', (req, res) => {
  * This minimizes CPU and RAM usage between sends.
  */
 
-async function waitForReady(state) {
-  if (state.ready && state.client?.pupPage && state.client?.pupBrowser) {
-    return state.client;
-  }
+async function waitForReady(state, timeoutMs = 15000) {
+  if (state.ready && state.client) return state.client;
 
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
-      reject(new Error("Client initialization timed out"));
-    }, 15000); // 15 sec timeout
+      cleanup();
+      reject(new Error('Timeout: Client did not become ready'));
+    }, timeoutMs);
 
     const onReady = () => {
-      clearTimeout(timeout);
+      cleanup();
       state.ready = true;
       resolve(state.client);
     };
-
+    
     const onFail = (msg) => {
-      clearTimeout(timeout);
-      reject(new Error(msg || 'Auth failed'));
+      cleanup();
+      reject(new Error(msg || 'Authentication failed'));
     };
 
-    try {
-      state.client.once('ready', onReady);
-      state.client.once('auth_failure', onFail);
-
-      if (!state.client.pupBrowser && !state.client.pupPage) {
-        state.client.initialize().catch(onFail);
-      }
-    } catch (err) {
+    const cleanup = () => {
       clearTimeout(timeout);
-      reject(err);
+      state.client?.off('ready', onReady);
+      state.client?.off('auth_failure', onFail);
+    };
+
+    state.client.once('ready', onReady);
+    state.client.once('auth_failure', onFail);
+
+    // if not already initialized, kick it off
+    if (!state.client.pupBrowser && !state.client.pupPage) {
+      state.client.initialize().catch((err) => {
+        cleanup();
+        reject(new Error(`Initialize failed: ${err.message}`));
+      });
     }
   });
 }
@@ -571,31 +575,33 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
   }
 
   try {
-    const state = await ensureInitialized(sessionId);
-    const client = state.client;
+    let state = sessions.get(sessionId);
 
-    if (!client?.pupBrowser || !client?.pupPage) {
-      return res.status(500).json({ error: "Client not fully initialized or Puppeteer context lost" });
+    if (!state) {
+      state = createClientInstance(sessionId);
+      sessions.set(sessionId, state);
     }
+
+    const client = await waitForReady(state);
 
     const phone = String(to).replace(/\D/g, '');
     const chatId = phone.includes('@c.us') ? phone : `${phone}@c.us`;
 
     const response = await client.sendMessage(chatId, message);
+
     res.json({ success: true, response });
 
     if (IDLE_MS === 0) {
-      setTimeout(async () => {
-        try { await client.destroy(); } catch {}
-        sessions.delete(sessionId);
-      }, 2000);
+      await client.destroy();
+      sessions.delete(sessionId);
     }
 
   } catch (err) {
-    console.error('Send failed:', err);
-    res.status(500).json({ error: err?.message || "Send failed" });
+    console.error('Send failed', err);
+    res.status(500).json({ error: err.message });
   }
 });
+
 
 /**
  * Logout: destroys client and wipes auth dir (unless you want to keep auth)

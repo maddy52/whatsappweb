@@ -198,38 +198,22 @@ const PUP_FLAGS = [
 ];
 
 function attachNetworkSlimming(client) {
-  const page = client?.pupPage;
-  if (!page || typeof page.setRequestInterception !== 'function') {
-    if (process.env.DEBUG) console.warn('Puppeteer page not ready for interception');
-    return;
-  }
+  client.pupPage.setRequestInterception(true).catch(() => {});
+  client.pupPage.on('request', (req) => {
+    const type = req.resourceType();
+    const url = req.url();
 
-  page.setRequestInterception(true).catch((err) => {
-    if (process.env.DEBUG) console.error('Failed to enable request interception:', err);
-  });
-
-  page.on('request', (req) => {
-    try {
-      const type = req.resourceType();
-      const url = req.url() || '';
-
-      if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
-        return req.abort().catch(() => {});
-      }
-
-      if (/google-analytics\.com|gstatic\.com|doubleclick\.net|googletagmanager|analytics|hotjar|facebook\.net|cdn\.ampproject/.test(url)) {
-        return req.abort().catch(() => {});
-      }
-
-     if (type === 'script') {
-  return req.continue().catch(() => {});
-}
-
-      return req.continue().catch(() => {});
-    } catch (err) {
-      if (process.env.DEBUG) console.error('Network slimming error:', err);
-      try { req.continue().catch(() => {}); } catch {}
+    // Kill heavy stuff, but never scripts / xhr / document
+    if (['image','media','font','stylesheet'].includes(type)) {
+      return req.abort().catch(() => {});
     }
+
+    // Only block trackers/ad domains
+    if (/doubleclick|googlesyndication|facebook|metrics/.test(url)) {
+      return req.abort().catch(() => {});
+    }
+
+    return req.continue().catch(() => {});
   });
 }
 
@@ -385,6 +369,7 @@ async function destroySession(trainerId) {
  * This is serialized per-trainer via s.initializing Promise to avoid duplicate launches.
  * Returns the state (with initialized client).
  */
+
 async function ensureInitialized(trainerId) {
   const s = getOrCreateState(trainerId);
 
@@ -396,32 +381,46 @@ async function ensureInitialized(trainerId) {
 
   // If initialization is already running, wait for it
   if (s.initializing) {
-  await s.initializing;
-  return s.ready ? s : Promise.reject(new Error(s.lastError || 'Initialization failed'));
-}
+    await s.initializing;
+    return s.ready ? s : Promise.reject(new Error(s.lastError || 'Initialization failed'));
+  }
 
   // Create instance if missing
   ensureClientInstance(trainerId);
 
   // Create a new initializing promise
   s.initializing = (async () => {
-    try {
-      // initialize will spawn Chromium (heavy step)
-      await s.client.initialize();
-      try { attachNetworkSlimming(s.client); } catch {}
-      s.lastError = null;
-      s.lastQR = s.lastQR || null;
-// s.ready will be flipped by client 'ready' event
-setIdleReaper(trainerId);
-    } catch (err) {
-      s.ready = false;
-      s.lastError = err?.message || String(err);
-      // ensure we don't leave a half-initialized client running
-      try { await stopClientKeepAuth(trainerId); } catch {}
-      throw err;
-    } finally {
-      s.initializing = null;
+    const maxRetries = 3;
+    let attempt = 0;
+    let lastError;
+
+    while (attempt < maxRetries) {
+      try {
+        attempt++;
+        // initialize will spawn Chromium (heavy step)
+        await s.client.initialize();
+        try { attachNetworkSlimming(s.client); } catch {}
+        s.lastError = null;
+        s.lastQR = s.lastQR || null;
+        // s.ready will be flipped by client 'ready' event
+        setIdleReaper(trainerId);
+        return; // success → exit retry loop
+      } catch (err) {
+        lastError = err;
+        s.ready = false;
+        s.lastError = err?.message || String(err);
+        // kill half-initialized client to avoid zombie
+        try { await stopClientKeepAuth(trainerId); } catch {}
+
+        if (attempt < maxRetries) {
+          // small delay before retry (exponential backoff optional)
+          await new Promise(res => setTimeout(res, 1000 * attempt));
+        }
+      }
     }
+
+    // if all retries failed
+    throw lastError;
   })();
 
   await s.initializing;
@@ -526,7 +525,7 @@ app.get('/sessions/:id/qr', (req, res) => {
  * This minimizes CPU and RAM usage between sends.
  */
 
-async function waitForReady(state, timeoutMs = Number(process.env.READY_TIMEOUT_MS || 30000)) {
+async function waitForReady(state, timeoutMs = Number(process.env.READY_TIMEOUT_MS || 60000)) {
   if (!state?.client) {
     throw new Error('Client is not initialized');
   }

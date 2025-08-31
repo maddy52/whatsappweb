@@ -655,6 +655,7 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
   try {
       // Wait until ready (will rely on events/polling)
     const client = await waitForReady(state);
+    await ensureInitialized(sessionId);
     const phone = String(to).replace(/\D/g, '');
     const chatId = phone.includes('@c.us') ? phone : `${phone}@c.us`;
 

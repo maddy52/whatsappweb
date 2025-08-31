@@ -688,10 +688,10 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
     const client = await waitForReady(state);
     await waitForConnected(client);  // <--- make sure WhatsApp injected fully
     await waitForWapiInjection(client);   // <--- NEW strict check
-    await client.getChats().catch(() => {});
+    
     const phone = String(to).replace(/\D/g, '');
     const chatId = phone.includes('@c.us') ? phone : `${phone}@c.us`;
-
+    await client.getChatById(chatId);
     const response = await client.sendMessage(chatId, message);
 
     res.json({ success: true, response });

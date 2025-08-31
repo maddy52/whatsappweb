@@ -632,7 +632,17 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
 
   // Ensure valid state exists
   let state = sessions.get(sessionId);
-  if (!state || !state.client) {
+  if (!state || !state.client || state.destroyed) {
+  console.log(`[${sessionId}] Session missing or destroyed, recreating...`);
+
+  if (state) {
+        try {
+          await stopClientKeepAuth(sessionId);
+        } catch (err) {
+          console.warn(`[${sessionId}] stopClientKeepAuth failed:`, err.message);
+        }
+      }
+    
     state = createClientInstance(sessionId);
     sessions.set(sessionId, state);
   }
@@ -707,7 +717,7 @@ app.post('/sessions/:id/logout', requireApiKey, async (req, res) => {
 //moiz refractored
 app.delete('/sessions/:id', requireApiKey, async (req, res) => {
   const id = req.params.id;
-  const purge = String(req.query.purge || 'true') === 'true';
+  const purge =  true;
 
   if (!isValidSessionId(id)) {
     return res.status(400).json({ error: 'Invalid session ID format' });

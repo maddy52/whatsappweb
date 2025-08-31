@@ -645,6 +645,7 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
     
     state = createClientInstance(sessionId);
     sessions.set(sessionId, state);
+    state.client.initialize();
   }
 
   // Prevent idle reaper from killing this session mid-send
@@ -652,11 +653,8 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
   if (state.idleTimer) { clearTimeout(state.idleTimer); state.idleTimer = null; }
 
   try {
-    // Ensure the client is initialized (centralized init with retries)
-    await ensureInitialized(sessionId);
-    // Wait until ready (will rely on events/polling)
+      // Wait until ready (will rely on events/polling)
     const client = await waitForReady(state);
-
     const phone = String(to).replace(/\D/g, '');
     const chatId = phone.includes('@c.us') ? phone : `${phone}@c.us`;
 

@@ -256,7 +256,7 @@ function setIdleReaper(trainerId) {
 
     s.ready = false;
     s.lastQR = null;
-    s.lastError = 'idle_destroyed';
+    s.lastError = null;
     s.client = null;
     s.idleTimer = null;
 

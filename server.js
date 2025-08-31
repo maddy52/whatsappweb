@@ -697,8 +697,7 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
     
     const phone = String(to).replace(/\D/g, '');
     const chatId = phone.includes('@c.us') ? phone : `${phone}@c.us`;
-    const chat = await client.getChatById(chatId);
-    console.log(chat, "chat arrived");
+    console.log("sending to : ", "chat arrived");
     const response = await client.sendMessage(chatId, message);
 
     res.json({ success: true, response });

@@ -634,6 +634,23 @@ async function waitForConnected(client, timeoutMs = 30000) {
   throw new Error('Timeout waiting for WhatsApp to connect');
 }
 
+async function waitForWapiInjection(client, timeoutMs = 30000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const ok = await client.pupPage.evaluate(() => {
+        return typeof window.Store !== 'undefined' &&
+               typeof window.Store.Chat !== 'undefined';
+      });
+      if (ok) return;
+    } catch (e) {
+      // ignore until ready
+    }
+    await new Promise(r => setTimeout(r, 500));
+  }
+  throw new Error('Timeout: WhatsApp API not injected');
+}
+
 
 app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
   const sessionId = req.params.id;
@@ -670,6 +687,8 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
       // Wait until ready (will rely on events/polling)
     const client = await waitForReady(state);
     await waitForConnected(client);  // <--- make sure WhatsApp injected fully
+    await waitForWapiInjection(client);   // <--- NEW strict check
+    await client.getChats().catch(() => {});
     const phone = String(to).replace(/\D/g, '');
     const chatId = phone.includes('@c.us') ? phone : `${phone}@c.us`;
 

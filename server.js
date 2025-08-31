@@ -535,28 +535,46 @@ app.get('/sessions/:id/qr', (req, res) => {
  */
 
 async function waitForReady(state, timeoutMs = Number(process.env.READY_TIMEOUT_MS || 30000)) {
-  if (!state?.client) {
-    throw new Error('Client is not initialized');
+  // If missing or destroyed, recreate safely
+  if (!state?.client || state.destroyed) {
+    console.log(`[${state?.id}] Client missing or destroyed, recreating...`);
+
+    if (state) {
+      try {
+        await stopClientKeepAuth(state.id);
+      } catch (err) {
+        console.warn(`[${state.id}] stopClientKeepAuth failed:`, err.message);
+      }
+    }
+
+    state = createClientInstance(state?.id);
+    sessions.set(state.id, state);
+    state.client.initialize();
   }
 
-  // If a QR is already present, we know we’re not authenticated yet.
+  // If a QR is already present, user must re-scan
   if (state.lastQR) {
     throw new Error('Authentication required: scan the QR first');
   }
 
-  if (state.ready) return state.client;
+  // Already ready and browser still alive
+  if (state.ready && state.client.pupPage && !state.client.pupPage.isClosed()) {
+    return state.client;
+  }
 
-  // If a global initialization is in progress for this state, wait for it first
+  // If initialization in progress, wait for it
   if (state.initializing) {
     try {
       await state.initializing;
     } catch (e) {
-      // initialization failed — propagate later via normal event listeners/timeouts
+      // let normal events/timeout handle errors
     }
-    if (state.ready) return state.client;
+    if (state.ready && state.client.pupPage && !state.client.pupPage.isClosed()) {
+      return state.client;
+    }
   }
 
-  // Race: ready/auth_failure/disconnected/timeout, and also poll getState()
+  // Race: ready/auth_failure/disconnected/timeout
   return new Promise((resolve, reject) => {
     const client = state.client;
     let settled = false;
@@ -572,6 +590,10 @@ async function waitForReady(state, timeoutMs = Number(process.env.READY_TIMEOUT_
 
     const onReady = () => {
       if (settled) return;
+      if (!client.pupPage || client.pupPage.isClosed()) {
+        cleanup();
+        return reject(new Error('Client ready but Puppeteer page closed'));
+      }
       state.ready = true;
       cleanup();
       resolve(client);
@@ -589,7 +611,7 @@ async function waitForReady(state, timeoutMs = Number(process.env.READY_TIMEOUT_
       reject(new Error('Authentication required: scan the QR first'));
     };
 
-    // Attach listeners BEFORE kicking initialize
+    // Attach listeners
     client.once('ready', onReady);
     client.once('auth_failure', onFail);
     client.once('disconnected', onFail);
@@ -602,12 +624,16 @@ async function waitForReady(state, timeoutMs = Number(process.env.READY_TIMEOUT_
       reject(new Error('Timeout: Client did not become ready'));
     }, timeoutMs);
 
-    // Also poll getState() to fast-path if already connected but 'ready' not yet emitted
+    // Polling fallback
     (async () => {
       try {
-        // 6 quick probes within timeout
         const start = Date.now();
         while (!settled && Date.now() - start < timeoutMs) {
+          if (!client.pupPage || client.pupPage.isClosed()) {
+            cleanup();
+            reject(new Error('Puppeteer page closed while waiting for ready'));
+            return;
+          }
           const st = await client.getState().catch(() => undefined);
           if (st === 'CONNECTED') {
             onReady();
@@ -615,7 +641,7 @@ async function waitForReady(state, timeoutMs = Number(process.env.READY_TIMEOUT_
           }
           await new Promise(r => setTimeout(r, 500));
         }
-      } catch {} // ignore, rely on main events/timeout
+      } catch { /* ignore, rely on timeout */ }
     })();
   });
 }
@@ -623,64 +649,53 @@ async function waitForReady(state, timeoutMs = Number(process.env.READY_TIMEOUT_
 
 app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
   const sessionId = req.params.id;
+  const { to, message } = req.body;
   console.log(req.body);
-  let { to, message } = req.body;
 
   if (!to || !message) {
     return res.status(400).json({ error: 'Missing "to" or "message"' });
   }
 
-  // Ensure valid state exists
   let state = sessions.get(sessionId);
-  if (!state || !state.client || state.destroyed) {
-  console.log(`[${sessionId}] Session missing or destroyed, recreating...`);
-
-  if (state) {
-        try {
-          await stopClientKeepAuth(sessionId);
-        } catch (err) {
-          console.warn(`[${sessionId}] stopClientKeepAuth failed:`, err.message);
-        }
-      }
-    
-    state = createClientInstance(sessionId);
-    sessions.set(sessionId, state);
-    state.client.initialize();
+  if (!state) {
+    return res.status(404).json({ error: 'Session not found' });
   }
 
-  // Prevent idle reaper from killing this session mid-send
+  // Prevent idle reaper mid-send
   state.busy = true;
-  if (state.idleTimer) { clearTimeout(state.idleTimer); state.idleTimer = null; }
+  if (state.idleTimer) {
+    clearTimeout(state.idleTimer);
+    state.idleTimer = null;
+  }
 
   try {
-      // Wait until ready (will rely on events/polling)
+    // ✅ This handles reinit if idle-destroyed
     const client = await waitForReady(state);
-    await ensureInitialized(sessionId);
+
     const phone = String(to).replace(/\D/g, '');
     const chatId = phone.includes('@c.us') ? phone : `${phone}@c.us`;
 
     const response = await client.sendMessage(chatId, message);
-
     res.json({ success: true, response });
 
-    // If the admin wants immediate tear-down between sends (legacy behavior),
-    // prefer a graceful stop that keeps auth files.
+    // Optional: immediate teardown
     if (IDLE_MS === 0) {
       try {
-        await stopClientKeepAuth(sessionId); // safer than client.destroy()
+        await stopClientKeepAuth(sessionId);
       } catch (e) {
         if (process.env.DEBUG) console.warn('stopClientKeepAuth after send failed', e?.message || e);
       }
     }
   } catch (err) {
-    console.error('Send failed', err);
+    console.error(`[${sessionId}] Send failed`, err);
     res.status(500).json({ error: err?.message || String(err) });
   } finally {
-    // allow idle reaper again (will schedule next reap)
     state.busy = false;
     try { setIdleReaper(sessionId); } catch {}
   }
 });
+
+
 
 
 

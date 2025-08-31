@@ -155,7 +155,9 @@ function getOrCreateState(trainerId) {
       lastQR: null, 
       lastError: null, 
       idleTimer: null, 
-      initializing: null });
+      initializing: null,
+      busy: false // NEW: prevents idle reaper during active operations
+    });
   }
   return sessions.get(trainerId);
 }
@@ -198,23 +200,30 @@ const PUP_FLAGS = [
 ];
 
 function attachNetworkSlimming(client) {
-  client.pupPage.setRequestInterception(true).catch(() => {});
-  client.pupPage.on('request', (req) => {
-    const type = req.resourceType();
-    const url = req.url();
+  try {
+    if (!client || !client.pupPage) return;
+    const page = client.pupPage;
+    if (typeof page.setRequestInterception !== 'function') return;
 
-    // Kill heavy stuff, but never scripts / xhr / document
-    if (['image','media','font','stylesheet'].includes(type)) {
-      return req.abort().catch(() => {});
-    }
+    page.setRequestInterception(true).catch(() => {});
+    page.on('request', (req) => {
+      const type = req.resourceType();
+      const url = req.url();
 
-    // Only block trackers/ad domains
-    if (/doubleclick|googlesyndication|facebook|metrics/.test(url)) {
-      return req.abort().catch(() => {});
-    }
+      if (['image','media','font','stylesheet'].includes(type)) {
+        return req.abort().catch(() => {});
+      }
 
-    return req.continue().catch(() => {});
-  });
+      if (/doubleclick|googlesyndication|facebook|metrics/.test(url)) {
+        return req.abort().catch(() => {});
+      }
+
+      return req.continue().catch(() => {});
+    });
+  } catch (err) {
+    // swallow — network slimming is best-effort
+    if (process.env.DEBUG) console.warn('attachNetworkSlimming error', err?.message || err);
+  }
 }
 
 
@@ -229,6 +238,13 @@ function setIdleReaper(trainerId) {
 
   if (!IDLE_MS || IDLE_MS < 10000) return; // Skip reaping if too low
 
+    // If busy, defer scheduling until not busy
+  if (s.busy) {
+    // schedule a short retry to check later (best-effort)
+    s.idleTimer = setTimeout(() => setIdleReaper(trainerId), 1000);
+    return;
+  }
+
   s.idleTimer = setTimeout(async () => {
     if (process.env.DEBUG) console.log(`Session ${trainerId} idle for ${IDLE_MS}ms, destroying client...`);
     
@@ -236,13 +252,6 @@ function setIdleReaper(trainerId) {
       if (s.client) await stopClientKeepAuth(trainerId);
     } catch (err) {
       if (process.env.DEBUG) console.warn(`Failed to stop client for ${trainerId}:`, err);
-    }
-
-    try {
-      const authPath = getAuthPath(trainerId);
-      pruneCaches(authPath);
-    } catch (err) {
-      if (process.env.DEBUG) console.warn(`Failed to prune caches for ${trainerId}:`, err);
     }
 
     s.ready = false;
@@ -537,6 +546,16 @@ async function waitForReady(state, timeoutMs = Number(process.env.READY_TIMEOUT_
 
   if (state.ready) return state.client;
 
+  // If a global initialization is in progress for this state, wait for it first
+  if (state.initializing) {
+    try {
+      await state.initializing;
+    } catch (e) {
+      // initialization failed — propagate later via normal event listeners/timeouts
+    }
+    if (state.ready) return state.client;
+  }
+
   // Race: ready/auth_failure/disconnected/timeout, and also poll getState()
   return new Promise((resolve, reject) => {
     const client = state.client;
@@ -583,16 +602,6 @@ async function waitForReady(state, timeoutMs = Number(process.env.READY_TIMEOUT_
       reject(new Error('Timeout: Client did not become ready'));
     }, timeoutMs);
 
-    // Kick initialize if needed
-    const needsInit = !client.pupBrowser && !client.pupPage;
-    if (needsInit) {
-      client.initialize().catch(err => {
-        if (settled) return;
-        cleanup();
-        reject(new Error(`Initialize failed: ${err.message}`));
-      });
-    }
-
     // Also poll getState() to fast-path if already connected but 'ready' not yet emitted
     (async () => {
       try {
@@ -614,25 +623,28 @@ async function waitForReady(state, timeoutMs = Number(process.env.READY_TIMEOUT_
 
 app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
   const sessionId = req.params.id;
-  console.log(req.body)
+  console.log(req.body);
   let { to, message } = req.body;
 
   if (!to || !message) {
     return res.status(400).json({ error: 'Missing "to" or "message"' });
   }
 
+  // Ensure valid state exists
+  let state = sessions.get(sessionId);
+  if (!state || !state.client) {
+    state = createClientInstance(sessionId);
+    sessions.set(sessionId, state);
+  }
+
+  // Prevent idle reaper from killing this session mid-send
+  state.busy = true;
+  if (state.idleTimer) { clearTimeout(state.idleTimer); state.idleTimer = null; }
+
   try {
-    let state = sessions.get(sessionId);
-console.log(state)
-    // 🔒 Ensure both session state and client exist
-    if (!state || !state.client) {
-      state = createClientInstance(sessionId);
-      sessions.set(sessionId, state);
-    }
-    if (state.lastQR) {
-  return res.status(412).json({ error: 'Not authenticated. Please scan QR for this session first.' });
-}
-console.log(state,12)
+    // Ensure the client is initialized (centralized init with retries)
+    await ensureInitialized(sessionId);
+    // Wait until ready (will rely on events/polling)
     const client = await waitForReady(state);
 
     const phone = String(to).replace(/\D/g, '');
@@ -642,14 +654,22 @@ console.log(state,12)
 
     res.json({ success: true, response });
 
+    // If the admin wants immediate tear-down between sends (legacy behavior),
+    // prefer a graceful stop that keeps auth files.
     if (IDLE_MS === 0) {
-      await client.destroy();
-      sessions.delete(sessionId);
+      try {
+        await stopClientKeepAuth(sessionId); // safer than client.destroy()
+      } catch (e) {
+        if (process.env.DEBUG) console.warn('stopClientKeepAuth after send failed', e?.message || e);
+      }
     }
-
   } catch (err) {
     console.error('Send failed', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err?.message || String(err) });
+  } finally {
+    // allow idle reaper again (will schedule next reap)
+    state.busy = false;
+    try { setIdleReaper(sessionId); } catch {}
   }
 });
 

@@ -639,62 +639,55 @@ async function waitForConnected(client, timeoutMs = 30000) {
 
 app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
   const sessionId = req.params.id;
-  console.log(req.body);
-  let { to, message } = req.body;
+  const { to, message } = req.body;
 
   if (!to || !message) {
     return res.status(400).json({ error: 'Missing "to" or "message"' });
   }
 
-  // Ensure valid state exists
   let state = sessions.get(sessionId);
   if (!state || !state.client || state.destroyed) {
-  console.log(`[${sessionId}] Session missing or destroyed, recreating...`);
-
-  if (state) {
-        try {
-          await stopClientKeepAuth(sessionId);
-        } catch (err) {
-          console.warn(`[${sessionId}] stopClientKeepAuth failed:`, err.message);
-        }
-      }
-    
+    console.log(`[${sessionId}] Session missing or destroyed, recreating...`);
+    if (state) {
+      try { await stopClientKeepAuth(sessionId); } catch {}
+    }
     state = createClientInstance(sessionId);
     sessions.set(sessionId, state);
     state.client.initialize();
   }
 
-  // Prevent idle reaper from killing this session mid-send
   state.busy = true;
-  if (state.idleTimer) { clearTimeout(state.idleTimer); state.idleTimer = null; }
+  if (state.idleTimer) clearTimeout(state.idleTimer);
 
   try {
-      // Wait until ready (will rely on events/polling)
     console.log("waiting for ready");
     const client = await waitForReady(state);
-    await waitForConnected(client);  // <--- make sure WhatsApp injected fully
-    
+    await waitForConnected(client);
+
     const phone = String(to).replace(/\D/g, '');
     const chatId = phone.includes('@c.us') ? phone : `${phone}@c.us`;
-    console.log("sending to : ", "chat arrived");
+
+    // 👇 NEW: check if user exists
+    const isRegistered = await client.isRegisteredUser(chatId);
+    if (!isRegistered) {
+      return res.status(404).json({ error: 'Recipient is not on WhatsApp' });
+    }
+
+    // 👇 NEW: hydrate chat if missing
+    await client.getNumberId(phone);
+
+    console.log("sending to:", chatId);
     const response = await client.sendMessage(chatId, message);
 
     res.json({ success: true, response });
 
-    // If the admin wants immediate tear-down between sends (legacy behavior),
-    // prefer a graceful stop that keeps auth files.
     if (IDLE_MS === 0) {
-      try {
-        await stopClientKeepAuth(sessionId); // safer than client.destroy()
-      } catch (e) {
-        if (process.env.DEBUG) console.warn('stopClientKeepAuth after send failed', e?.message || e);
-      }
+      try { await stopClientKeepAuth(sessionId); } catch {}
     }
   } catch (err) {
     console.error('Send failed', err);
     res.status(500).json({ error: err?.message || String(err) });
   } finally {
-    // allow idle reaper again (will schedule next reap)
     state.busy = false;
     try { setIdleReaper(sessionId); } catch {}
   }

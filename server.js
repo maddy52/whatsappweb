@@ -238,8 +238,9 @@ function setIdleReaper(trainerId) {
 
   if (!IDLE_MS || IDLE_MS < 10000) return; // Skip reaping if too low
 
-    // If busy, defer scheduling until not busy
-  if (s.busy) {
+   // If busy or initialization in progress, defer scheduling until done.
+  // This prevents the reaper from destroying the client while it's starting up.
+  if (s.busy || s.initializing) {
     // schedule a short retry to check later (best-effort)
     s.idleTimer = setTimeout(() => setIdleReaper(trainerId), 1000);
     return;
@@ -256,7 +257,7 @@ function setIdleReaper(trainerId) {
 
     s.ready = false;
     s.lastQR = null;
-    s.lastError = null;
+    s.lastError = 'idle_destroyed';
     s.client = null;
     s.idleTimer = null;
 
@@ -324,7 +325,7 @@ function createClientInstance(trainerId) {
 
   // Keep a ref but do not mark ready until initialize resolves
   state.client = client;
-  // state.lastError = null;
+   state.lastError = null;
   sessions.set(trainerId, state);
   return state;
 }
@@ -397,41 +398,45 @@ async function ensureInitialized(trainerId) {
   // Create instance if missing
   ensureClientInstance(trainerId);
 
-  // Create a new initializing promise
+    // Create a new initializing promise (serialized per-session)
   s.initializing = (async () => {
-    const maxRetries = 3;
-    let attempt = 0;
-    let lastError;
+    try {
+      // If we were reaped by the idle reaper previously, clear that stale marker
+      // so a fresh initialization attempt proceeds normally.
+      if (s.lastError === 'idle_destroyed') s.lastError = null;
 
-    while (attempt < maxRetries) {
-      try {
-        attempt++;
-        // initialize will spawn Chromium (heavy step)
-        await s.client.initialize();
-        try { attachNetworkSlimming(s.client); } catch {}
-        s.lastError = null;
-        s.lastQR = s.lastQR || null;
-        // s.ready will be flipped by client 'ready' event
-        setIdleReaper(trainerId);
-        return; // success → exit retry loop
-      } catch (err) {
-        lastError = err;
-        s.ready = false;
-        s.lastError = err?.message || String(err);
-        // kill half-initialized client to avoid zombie
-        try { await stopClientKeepAuth(trainerId); } catch {}
-
-        if (attempt < maxRetries) {
-          // small delay before retry (exponential backoff optional)
-          await new Promise(res => setTimeout(res, 1000 * attempt));
+      const maxRetries = 3;
+      let attempt = 0;
+      let lastError;
+      while (attempt < maxRetries) {
+        try {
+          attempt++;
+          // initialize will spawn Chromium (heavy step)
+          await s.client.initialize();
+          try { attachNetworkSlimming(s.client); } catch {}
+          s.lastError = null;
+          s.lastQR = s.lastQR || null;
+          // s.ready will be flipped by client 'ready' event
+          setIdleReaper(trainerId);
+          return; // success → exit retry loop
+        } catch (err) {
+          lastError = err;
+          s.ready = false;
+          s.lastError = err?.message || String(err);
+          // kill half-initialized client to avoid zombie
+          try { await stopClientKeepAuth(trainerId); } catch {}
+          if (attempt < maxRetries) {
+            await new Promise(res => setTimeout(res, 1000 * attempt));
+          }
         }
       }
+      // if all retries failed throw lastError;
+      throw lastError;
+    } finally {
+      // always clear initializing so future callers don't await a stale promise
+      s.initializing = null;
     }
-
-    // if all retries failed
-    throw lastError;
   })();
-
   await s.initializing;
   return s;
 }

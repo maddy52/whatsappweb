@@ -311,8 +311,10 @@ function createClientInstance(trainerId) {
 
   client.on('authenticated', () => {
     console.log(`[${trainerId}] AUTHENTICATED`);
-    setIdleReaper(trainerId));
-}
+    setIdleReaper(trainerId)
+      });
+
+  
   client.on('auth_failure', (msg) => {
     state.ready = false;
     state.lastError = `auth_failure: ${msg}`;

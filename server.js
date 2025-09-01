@@ -292,13 +292,11 @@ function createClientInstance(trainerId) {
 
   // Minimal event handlers only
   client.on('qr', (qr) => {
-  // Only emit/store QR if we're not already authenticated
-  if (client.authStrategy?.state === 'DISCONNECTED') {
     state.lastQR = qr;
     state.ready = false;
     state.lastError = null;
+    console.log(`[${trainerId}] QR RECEIVED`)
     setIdleReaper(trainerId);
-  }
 });
 
   client.on('ready', () => {
@@ -307,14 +305,18 @@ function createClientInstance(trainerId) {
     state.lastError = null;
     // slim the network to reduce CPU/memory while client is alive
     attachNetworkSlimming(client);
+    console.log(`[${trainerId}] READY`)
     setIdleReaper(trainerId);
   });
 
-  client.on('authenticated', () => setIdleReaper(trainerId));
-
+  client.on('authenticated', () => {
+    console.log(`[${trainerId}] AUTHENTICATED`);
+    setIdleReaper(trainerId));
+}
   client.on('auth_failure', (msg) => {
     state.ready = false;
     state.lastError = `auth_failure: ${msg}`;
+    console.log(`[${trainerId}] AUTH FAILURE`, msg)
     setIdleReaper(trainerId);
   });
 

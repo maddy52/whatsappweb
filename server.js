@@ -292,11 +292,14 @@ function createClientInstance(trainerId) {
 
   // Minimal event handlers only
   client.on('qr', (qr) => {
+  // Only emit/store QR if we're not already authenticated
+  if (client.authStrategy?.state === 'DISCONNECTED') {
     state.lastQR = qr;
     state.ready = false;
     state.lastError = null;
     setIdleReaper(trainerId);
-  });
+  }
+});
 
   client.on('ready', () => {
     state.ready = true;
@@ -656,9 +659,10 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
     if (state) {
       try { await stopClientKeepAuth(sessionId); } catch {}
     }
+    
     state = createClientInstance(sessionId);
     sessions.set(sessionId, state);
-    state.client.initialize();
+    await ensureInitialized(sessionId); // restores session if auth exists, or shows QR if not
   }
 
   state.busy = true;

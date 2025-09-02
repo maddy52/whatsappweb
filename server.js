@@ -4,6 +4,7 @@ const fs = require('fs').promises;
 const fssync = require('fs');
 const path = require('path');
 const { Client, LocalAuth } = require('whatsapp-web.js');
+const puppeteer = require('puppeteer');
 const QRCode = require('qrcode');
 
 const app = express();
@@ -195,8 +196,7 @@ const PUP_FLAGS = [
   '--blink-settings=imagesEnabled=false',
   '--disk-cache-size=1',
   '--media-cache-size=1',
-  '--disable-accelerated-2d-canvas',
-  '--headless=new' // modern headless mode
+  '--disable-accelerated-2d-canvas'
 ];
 
 function attachNetworkSlimming(client) {
@@ -283,7 +283,7 @@ function createClientInstance(trainerId) {
     takeoverOnConflict: true,
     puppeteer: {
       headless: true,
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      executablePath: puppeteer.executablePath() || process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       args: PUP_FLAGS,
       defaultViewport: { width: 800, height: 600 },
       ignoreHTTPSErrors: true

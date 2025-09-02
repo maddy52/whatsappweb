@@ -1,20 +1,29 @@
-/* Multi-tenant WhatsApp sender gateway (on-demand, lean) */
+/* Multi-tenant WhatsApp sender gateway (on-demand, lean) - media-enabled
+   - Adds /sessions/:id/sendMedia to upload and send files (images, audio, video, pdf, doc/docx)
+   - Stores media under data/media/<trainerId>/ with retention (default 32 days)
+   - Background cleaner removes files older than retentionDays once per day (configurable)
+   - Uses multer for robust multipart handling with size limits and MIME/extension validation
+   - Keeps existing session/auth behaviour and idle reaper logic
+*/
+
 const express = require('express');
 const fs = require('fs').promises;
 const fssync = require('fs');
 const path = require('path');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const puppeteer = require('puppeteer');
 const QRCode = require('qrcode');
+const multer = require('multer');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-
 const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || '';
 const BASE_AUTH_DIR = path.resolve(process.env.BASE_AUTH_DIR || './data/auth');
-// Default to very short idle time to free resources quickly. Set via env if needed.
+const BASE_MEDIA_DIR = path.resolve(process.env.BASE_MEDIA_DIR || './data/media');
+// Default to retention in days; can be set via env
+const RETENTION_DAYS = Number(process.env.MEDIA_RETENTION_DAYS || 32); // keep 32 days by default
 const IDLE_MS = Number(process.env.IDLE_MS || 30000); // 30s
 
 /* ---------------- CORS + frame security (unchanged behavior) ---------------- */
@@ -44,16 +53,22 @@ function isOriginAllowed(origin) {
   );
 }
 
-//moiz refractored
 function isValidSessionId(id) {
   return /^[a-zA-Z0-9_-]+$/.test(id);
 }
 
-//moiz refractored
 function getAuthPath(trainerId) {
   const fullPath = path.resolve(BASE_AUTH_DIR, trainerId);
   if (!fullPath.startsWith(BASE_AUTH_DIR)) {
     throw new Error('Invalid session path');
+  }
+  return fullPath;
+}
+
+function getMediaPath(trainerId) {
+  const fullPath = path.resolve(BASE_MEDIA_DIR, trainerId);
+  if (!fullPath.startsWith(BASE_MEDIA_DIR)) {
+    throw new Error('Invalid media path');
   }
   return fullPath;
 }
@@ -120,7 +135,6 @@ function cleanChromiumLocks(baseDir) {
 }
 
 function pruneCaches(authPath) {
-  // Nuke heavy Chromium caches but keep auth/session data
   const toDelete = [
     'Default/Cache',
     'Default/Code Cache',
@@ -140,12 +154,6 @@ function pruneCaches(authPath) {
 
 /* ---------------- session manager ---------------- */
 
-/**
- * session state:
- * {
- *   client, ready, lastQR, lastError, idleTimer, initializing (Promise|null)
- * }
- */
 const sessions = new Map(); // trainerId -> state
 
 function getOrCreateState(trainerId) {
@@ -157,7 +165,7 @@ function getOrCreateState(trainerId) {
       lastError: null, 
       idleTimer: null, 
       initializing: null,
-      busy: false // NEW: prevents idle reaper during active operations
+      busy: false
     });
   }
   return sessions.get(trainerId);
@@ -221,11 +229,9 @@ function attachNetworkSlimming(client) {
       return req.continue().catch(() => {});
     });
   } catch (err) {
-    // swallow — network slimming is best-effort
     if (process.env.DEBUG) console.warn('attachNetworkSlimming error', err?.message || err);
   }
 }
-
 
 function setIdleReaper(trainerId) {
   const s = sessions.get(trainerId);
@@ -238,10 +244,7 @@ function setIdleReaper(trainerId) {
 
   if (!IDLE_MS || IDLE_MS < 10000) return; // Skip reaping if too low
 
-   // If busy or initialization in progress, defer scheduling until done.
-  // This prevents the reaper from destroying the client while it's starting up.
   if (s.busy || s.initializing) {
-    // schedule a short retry to check later (best-effort)
     s.idleTimer = setTimeout(() => setIdleReaper(trainerId), 1000);
     return;
   }
@@ -265,11 +268,6 @@ function setIdleReaper(trainerId) {
   }, IDLE_MS);
 }
 
-
-/**
- * Create the client instance and attach only minimal event handlers.
- * Does not call initialize() here — that's done explicitly in ensureInitialized.
- */
 function createClientInstance(trainerId) {
   const authPath = getAuthPath(trainerId);
   ensureDir(authPath);
@@ -290,20 +288,18 @@ function createClientInstance(trainerId) {
     }
   });
 
-  // Minimal event handlers only
   client.on('qr', (qr) => {
     state.lastQR = qr;
     state.ready = false;
     state.lastError = null;
     console.log(`[${trainerId}] QR RECEIVED`)
     setIdleReaper(trainerId);
-});
+  });
 
   client.on('ready', () => {
     state.ready = true;
     state.lastQR = null;
     state.lastError = null;
-    // slim the network to reduce CPU/memory while client is alive
     attachNetworkSlimming(client);
     console.log(`[${trainerId}] READY`)
     setIdleReaper(trainerId);
@@ -312,9 +308,8 @@ function createClientInstance(trainerId) {
   client.on('authenticated', () => {
     console.log(`[${trainerId}] AUTHENTICATED`);
     setIdleReaper(trainerId)
-      });
+  });
 
-  
   client.on('auth_failure', (msg) => {
     state.ready = false;
     state.lastError = `auth_failure: ${msg}`;
@@ -327,28 +322,20 @@ function createClientInstance(trainerId) {
     state.lastError = `disconnected: ${reason}`;
     state.lastQR = null;
     setIdleReaper(trainerId);
-    // we intentionally do NOT auto re-init here; initialize on demand
   });
 
-  // Keep a ref but do not mark ready until initialize resolves
   state.client = client;
-   state.lastError = null;
+  state.lastError = null;
   sessions.set(trainerId, state);
   return state;
 }
 
-/**
- * Ensure client is created (but not necessarily initialized).
- */
 function ensureClientInstance(trainerId) {
   const s = getOrCreateState(trainerId);
   if (!s.client) createClientInstance(trainerId);
   return s;
 }
 
-/**
- * Stop/destroy the active client but KEEP the auth files so user won't need QR next time.
- */
 async function stopClientKeepAuth(trainerId) {
   const s = sessions.get(trainerId);
   if (!s) return;
@@ -356,7 +343,7 @@ async function stopClientKeepAuth(trainerId) {
   if (s.idleTimer) { clearTimeout(s.idleTimer); s.idleTimer = null; }
   try {
     if (s.client) {
-      await s.client.destroy(); // Kills Chromium process
+      await s.client.destroy();
     }
   } catch (err) {
     console.warn(`stopClientKeepAuth failed for ${trainerId}:`, err.message);
@@ -368,9 +355,6 @@ async function stopClientKeepAuth(trainerId) {
   s.lastError = null;
 }
 
-/**
- * Fully destroy session and auth dir
- */
 async function destroySession(trainerId) {
   const s = sessions.get(trainerId);
   if (!s) return;
@@ -381,35 +365,23 @@ async function destroySession(trainerId) {
   sessions.delete(trainerId);
 }
 
-/**
- * Core: initialize (start Chromium & whatsapp-web.js).
- * This is serialized per-trainer via s.initializing Promise to avoid duplicate launches.
- * Returns the state (with initialized client).
- */
-
 async function ensureInitialized(trainerId) {
   const s = getOrCreateState(trainerId);
 
-  // If already ready, touch idle timer and return
   if (s.ready && s.client) {
     setIdleReaper(trainerId);
     return s;
   }
 
-  // If initialization is already running, wait for it
   if (s.initializing) {
     await s.initializing;
     return s.ready ? s : Promise.reject(new Error(s.lastError || 'Initialization failed'));
   }
 
-  // Create instance if missing
   ensureClientInstance(trainerId);
 
-    // Create a new initializing promise (serialized per-session)
   s.initializing = (async () => {
     try {
-      // If we were reaped by the idle reaper previously, clear that stale marker
-      // so a fresh initialization attempt proceeds normally.
       if (s.lastError === 'idle_destroyed') s.lastError = null;
 
       const maxRetries = 3;
@@ -418,29 +390,24 @@ async function ensureInitialized(trainerId) {
       while (attempt < maxRetries) {
         try {
           attempt++;
-          // initialize will spawn Chromium (heavy step)
           await s.client.initialize();
           try { attachNetworkSlimming(s.client); } catch {}
           s.lastError = null;
           s.lastQR = s.lastQR || null;
-          // s.ready will be flipped by client 'ready' event
           setIdleReaper(trainerId);
-          return; // success → exit retry loop
+          return;
         } catch (err) {
           lastError = err;
           s.ready = false;
           s.lastError = err?.message || String(err);
-          // kill half-initialized client to avoid zombie
           try { await stopClientKeepAuth(trainerId); } catch {}
           if (attempt < maxRetries) {
             await new Promise(res => setTimeout(res, 1000 * attempt));
           }
         }
       }
-      // if all retries failed throw lastError;
       throw lastError;
     } finally {
-      // always clear initializing so future callers don't await a stale promise
       s.initializing = null;
     }
   })();
@@ -451,10 +418,7 @@ async function ensureInitialized(trainerId) {
 /* ---------------- routes ---------------- */
 
 app.get('/healthz', (_req, res) => res.status(200).send('ok'));
-
-app.get('/', (_req, res) => {
-  res.send('WhatsApp sender gateway is up.');
-});
+app.get('/', (_req, res) => { res.send('WhatsApp sender gateway is up.'); });
 
 app.get('/sessions', requireApiKey, (_req, res) => {
   const list = Array.from(sessions.entries()).map(([id, s]) => ({
@@ -463,10 +427,6 @@ app.get('/sessions', requireApiKey, (_req, res) => {
   res.json({ sessions: list });
 });
 
-/**
- * Create a session record and initialize to produce QR (on-demand)
- * This endpoint will spin Chromium so user can scan QR.
- */
 app.post('/sessions', requireApiKey, async (req, res) => {
   const { trainerId } = req.body || {};
   if (!trainerId || !isValidSessionId(trainerId)) {
@@ -476,19 +436,14 @@ app.post('/sessions', requireApiKey, async (req, res) => {
   ensureClientInstance(trainerId);
 
   try {
-    // initialize only to show QR / authenticate. If already authenticated, will return quickly.
     await ensureInitialized(trainerId);
   } catch (err) {
-    // If initialization failed but we have a lastQR, let the client fetch it.
-    // Return progress anyway (we keep state so QR route can check).
+    // allow QR fetching even if init failed
   }
   const s = sessions.get(trainerId);
   res.json({ ok: true, trainerId, ready: !!s?.ready, qrAvailable: !!s?.lastQR, lastError: s?.lastError });
 });
 
-/**
- * Get session status
- */
 app.get('/sessions/:id/status', requireApiKey, (req, res) => {
   const id = req.params.id;
   const s = sessions.get(id);
@@ -497,7 +452,6 @@ app.get('/sessions/:id/status', requireApiKey, (req, res) => {
   res.json({ ready: !!s.ready, qrAvailable: !!s.lastQR, lastError: s.lastError });
 });
 
-// HEAD support for QR endpoint
 app.head('/sessions/:id/qr', (req, res) => {
   const id = req.params.id;
   const s = sessions.get(id);
@@ -505,7 +459,6 @@ app.head('/sessions/:id/qr', (req, res) => {
   return res.sendStatus(404);
 });
 
-// QR as JSON (data URL)
 app.get('/sessions/:id/qr.json', (req, res) => {
   const id = req.params.id;
   const s = sessions.get(id);
@@ -516,7 +469,6 @@ app.get('/sessions/:id/qr.json', (req, res) => {
     .catch(() => res.status(500).json({ error: 'Failed to generate QR' }));
 });
 
-// QR page (HTML)
 app.get('/sessions/:id/qr', (req, res) => {
   const id = req.params.id;
   const s = sessions.get(id);
@@ -540,35 +492,26 @@ app.get('/sessions/:id/qr', (req, res) => {
     .catch(() => res.status(500).send('Failed to render QR.'));
 });
 
-/**
- * Send text message (on-demand)
- * Behavior: initialize client if necessary, send, then IMMEDIATELY destroy Chromium (keeping auth).
- * This minimizes CPU and RAM usage between sends.
- */
+/* ---------------- send text (unchanged) ---------------- */
 
 async function waitForReady(state, timeoutMs = Number(process.env.READY_TIMEOUT_MS || 30000)) {
   if (!state?.client) {
     throw new Error('Client is not initialized');
   }
 
-  // If a QR is already present, we know we’re not authenticated yet.
   if (state.lastQR) {
     throw new Error('Authentication required: scan the QR first');
   }
 
   if (state.ready) return state.client;
 
-  // If a global initialization is in progress for this state, wait for it first
   if (state.initializing) {
     try {
       await state.initializing;
-    } catch (e) {
-      // initialization failed — propagate later via normal event listeners/timeouts
-    }
+    } catch (e) {}
     if (state.ready) return state.client;
   }
 
-  // Race: ready/auth_failure/disconnected/timeout, and also poll getState()
   return new Promise((resolve, reject) => {
     const client = state.client;
     let settled = false;
@@ -601,23 +544,19 @@ async function waitForReady(state, timeoutMs = Number(process.env.READY_TIMEOUT_
       reject(new Error('Authentication required: scan the QR first'));
     };
 
-    // Attach listeners BEFORE kicking initialize
     client.once('ready', onReady);
     client.once('auth_failure', onFail);
     client.once('disconnected', onFail);
     client.once('qr', onQR);
 
-    // Timeout
     const t = setTimeout(() => {
       if (settled) return;
       cleanup();
       reject(new Error('Timeout: Client did not become ready'));
     }, timeoutMs);
 
-    // Also poll getState() to fast-path if already connected but 'ready' not yet emitted
     (async () => {
       try {
-        // 6 quick probes within timeout
         const start = Date.now();
         while (!settled && Date.now() - start < timeoutMs) {
           const st = await client.getState().catch(() => undefined);
@@ -627,7 +566,7 @@ async function waitForReady(state, timeoutMs = Number(process.env.READY_TIMEOUT_
           }
           await new Promise(r => setTimeout(r, 500));
         }
-      } catch {} // ignore, rely on main events/timeout
+      } catch {} 
     })();
   });
 }
@@ -640,14 +579,11 @@ async function waitForConnected(client, timeoutMs = 30000) {
       if (state === 'CONNECTED'){ 
         console.log("wait for connected completed");
         return};
-    } catch (e) {
-      // client not ready yet
-    }
+    } catch (e) {}
     await new Promise(r => setTimeout(r, 500));
   }
   throw new Error('Timeout waiting for WhatsApp to connect');
 }
-
 
 app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
   const sessionId = req.params.id;
@@ -660,13 +596,10 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
   let state = sessions.get(sessionId);
   if (!state || !state.client || state.destroyed) {
     console.log(`[${sessionId}] Session missing or destroyed, recreating...`);
-    if (state) {
-      try { await stopClientKeepAuth(sessionId); } catch {}
-    }
-    
+    if (state) { try { await stopClientKeepAuth(sessionId); } catch {} }
     state = createClientInstance(sessionId);
     sessions.set(sessionId, state);
-    await ensureInitialized(sessionId); // restores session if auth exists, or shows QR if not
+    await ensureInitialized(sessionId);
   }
 
   state.busy = true;
@@ -680,13 +613,11 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
     const phone = String(to).replace(/\D/g, '');
     const chatId = phone.includes('@c.us') ? phone : `${phone}@c.us`;
 
-    // 👇 NEW: check if user exists
     const isRegistered = await client.isRegisteredUser(chatId);
     if (!isRegistered) {
       return res.status(404).json({ error: 'Recipient is not on WhatsApp' });
     }
 
-    // 👇 NEW: hydrate chat if missing
     await client.getNumberId(phone);
 
     console.log("sending to:", chatId);
@@ -706,13 +637,168 @@ app.post('/sessions/:id/send', requireApiKey, async (req, res) => {
   }
 });
 
+/* ---------------- send media ---------------- */
 
+// configure multer storage — write to temp location inside media dir then keep
+ensureDir(BASE_MEDIA_DIR);
 
-/**
- * Logout: destroys client and wipes auth dir (unless you want to keep auth)
- */
+const MAX_FILE_SIZE = Number(process.env.MAX_MEDIA_BYTES || 25 * 1024 * 1024); // default 25MB
 
-//moiz refractored
+// Allowed MIME types + extensions
+const ALLOWED_MIMES = new Set([
+  'image/jpeg','image/png','image/webp','image/gif','image/heif',
+  'video/mp4','video/quicktime','video/webm','audio/mpeg','audio/ogg',
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+]);
+
+function fileFilter(req, file, cb) {
+  const ok = ALLOWED_MIMES.has(file.mimetype);
+  if (!ok) return cb(new Error('Unsupported file type'), false);
+  cb(null, true);
+}
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: async (req, file, cb) => {
+      try {
+        const trainerId = req.params.id;
+        if (!isValidSessionId(trainerId)) return cb(new Error('Invalid session id'));
+        const mediaPath = getMediaPath(trainerId);
+        ensureDir(mediaPath);
+        cb(null, mediaPath);
+      } catch (e) { cb(e); }
+    },
+    filename: (req, file, cb) => {
+      // use timestamp + random for uniqueness
+      const ext = path.extname(file.originalname) || '';
+      const name = `${Date.now()}-${Math.random().toString(36).slice(2,8)}${ext}`;
+      cb(null, name);
+    }
+  }),
+  limits: { fileSize: MAX_FILE_SIZE, files: 1 },
+  fileFilter
+});
+
+// helper to validate file extension additionally (defence in depth)
+function isAllowedExtension(filename) {
+  const ext = path.extname(filename).toLowerCase();
+  const allowed = ['.jpg','.jpeg','.png','.webp','.gif','.heif','.mp4','.mov','.webm','.mp3','.ogg','.pdf','.doc','.docx'];
+  return allowed.includes(ext);
+}
+
+app.post('/sessions/:id/sendMedia', requireApiKey, upload.single('file'), async (req, res) => {
+  const sessionId = req.params.id;
+  const { to, caption } = req.body;
+
+  if (!to) {
+    // multer already saved file — ensure we remove it to avoid orphan
+    if (req.file) try { await fs.rm(req.file.path); } catch {};
+    return res.status(400).json({ error: 'Missing "to" field' });
+  }
+
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+  // extra extension check
+  if (!isAllowedExtension(req.file.originalname)) {
+    try { await fs.rm(req.file.path); } catch {}
+    return res.status(400).json({ error: 'File extension not allowed' });
+  }
+
+  let state = sessions.get(sessionId);
+  if (!state || !state.client || state.destroyed) {
+    console.log(`[${sessionId}] Session missing or destroyed, recreating...`);
+    if (state) { try { await stopClientKeepAuth(sessionId); } catch {} }
+    state = createClientInstance(sessionId);
+    sessions.set(sessionId, state);
+    await ensureInitialized(sessionId);
+  }
+
+  state.busy = true;
+  if (state.idleTimer) clearTimeout(state.idleTimer);
+
+  try {
+    const client = await waitForReady(state);
+    await waitForConnected(client);
+
+    const phone = String(to).replace(/\D/g, '');
+    const chatId = phone.includes('@c.us') ? phone : `${phone}@c.us`;
+
+    const isRegistered = await client.isRegisteredUser(chatId);
+    if (!isRegistered) {
+      return res.status(404).json({ error: 'Recipient is not on WhatsApp' });
+    }
+
+    // Read file and convert to base64 for MessageMedia
+    const buffer = await fs.readFile(req.file.path);
+    const base64 = buffer.toString('base64');
+    const mimetype = req.file.mimetype || 'application/octet-stream';
+    const filename = req.file.originalname;
+
+    const media = new MessageMedia(mimetype, base64, filename);
+
+    // send
+    const sendResult = await client.sendMessage(chatId, media, { caption: caption || undefined });
+
+    res.json({ success: true, file: path.basename(req.file.path), sendResult });
+
+    if (IDLE_MS === 0) {
+      try { await stopClientKeepAuth(sessionId); } catch {}
+    }
+  } catch (err) {
+    console.error('Send media failed', err);
+    // do not delete file on failure — we keep media retained for retries/inspection
+    res.status(500).json({ error: err?.message || String(err) });
+  } finally {
+    state.busy = false;
+    try { setIdleReaper(sessionId); } catch {}
+  }
+});
+
+/* ---------------- media retention cleaner ---------------- */
+
+// Run a daily sweep to remove files older than RETENTION_DAYS. Also run at startup.
+async function sweepMediaDir() {
+  try {
+    const cutoff = Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    if (!fssync.existsSync(BASE_MEDIA_DIR)) return;
+
+    const trainers = await fs.readdir(BASE_MEDIA_DIR, { withFileTypes: true });
+    for (const t of trainers) {
+      if (!t.isDirectory()) continue;
+      const trainerId = t.name;
+      if (!isValidSessionId(trainerId)) continue;
+      const dir = getMediaPath(trainerId);
+      const files = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+      for (const f of files) {
+        if (!f.isFile()) continue;
+        const full = path.join(dir, f.name);
+        try {
+          const stat = await fs.stat(full);
+          if (stat.mtimeMs < cutoff) {
+            await fs.rm(full, { force: true });
+            if (process.env.DEBUG) console.log('Removed old media', full);
+          }
+        } catch (e) {
+          // ignore single-file errors
+        }
+      }
+      // optional: remove empty trainer dir
+      try {
+        const remaining = await fs.readdir(dir);
+        if (remaining.length === 0) await fs.rmdir(dir).catch(() => {});
+      } catch {}
+    }
+  } catch (e) { console.error('Media sweep failed', e); }
+}
+
+// schedule daily (once per 24h) and run at startup
+sweepMediaDir().catch(() => {});
+setInterval(() => { sweepMediaDir().catch(() => {}); }, 24 * 60 * 60 * 1000);
+
+/* ---------------- logout / delete ---------------- */
+
 app.post('/sessions/:id/logout', requireApiKey, async (req, res) => {
   const id = req.params.id;
 
@@ -737,10 +823,9 @@ app.post('/sessions/:id/logout', requireApiKey, async (req, res) => {
   }
 });
 
-//moiz refractored
 app.delete('/sessions/:id', requireApiKey, async (req, res) => {
   const id = req.params.id;
-  const purge =  true;
+  const purge = true;
 
   if (!isValidSessionId(id)) {
     return res.status(400).json({ error: 'Invalid session ID format' });
@@ -756,6 +841,11 @@ app.delete('/sessions/:id', requireApiKey, async (req, res) => {
       } catch (err) {
         console.error(`Failed to purge auth data for session ${id}:`, err);
       }
+      // also purge media for this trainer
+      try {
+        const mediaPath = getMediaPath(id);
+        await fs.rm(mediaPath, { recursive: true, force: true });
+      } catch (err) {}
     }
 
     res.json({ ok: true, purged: purge });
@@ -767,4 +857,5 @@ app.delete('/sessions/:id', requireApiKey, async (req, res) => {
 
 /* ---------------- start ---------------- */
 ensureDir(BASE_AUTH_DIR);
+ensureDir(BASE_MEDIA_DIR);
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
